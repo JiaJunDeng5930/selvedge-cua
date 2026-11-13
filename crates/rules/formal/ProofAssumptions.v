@@ -19,13 +19,15 @@ Print Assumptions sample_times_single.
 Print Assumptions group_frames_preserves_latest.
 Print Assumptions local_change_contract.
 Print Assumptions same_scroll_contract.
-Print Assumptions select_bucket_member.
-Print Assumptions history_slots_reserve_viewport.
 Print Assumptions reference_live_contract.
 Print Assumptions authorize_insertion_contract.
+Print Assumptions pack_images_contract.
 
-Print Assumptions delivery_plan_budget.
-Print Assumptions one_image_includes_viewport.
+Require Import Requirement.
+Print Assumptions transient_keeps_full_a_b_a.
+Print Assumptions TransientObservationExample.a_a_a_b_a_has_a_readable_economical_report.
+Print Assumptions overlapping_report_has_visible_samples_before_and_after.
+Print Assumptions spontaneous_effect_refutes_background.
 
 Print Assumptions first_destination.
 Print Assumptions continuation_preserves_destination.

@@ -108,9 +108,12 @@ def result(client, code):
     return client.run(code)[0]["result"]
 
 
+def png_attachments(content):
+    return [item for item in content if item["type"] == "image"]
+
+
 def screenshot(content, index):
-    pngs = [item for item in content if item["type"] == "image"]
-    image = pngs[index]
+    image = png_attachments(content)[index]
     assert image["mimeType"] == "image/png"
     png = base64.b64decode(image["data"])
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
@@ -127,6 +130,78 @@ def observation(reply, content):
     return manifest
 
 
+def local_screen_change(client, fixture_binary, pid, region, events):
+    interval_ms = 90
+    reply, content = client.run(f"""
+        const all = node => [node,...(node.children ?? []).flatMap(all)];
+        const {{window}} = await readUI({{pid:{pid}}});
+        const button = all(window).find(n=>n.title==="Pulse");
+        const screen = observeScreen({{
+            target: {{region:{json.dumps(region)}}}, durationMs:1450,
+            intervalMs:{interval_ms}, imageBudget:3
+        }});
+        const before = await screen.started;
+        const press = await performUIAction({{target:button.target,action:"AXPress"}});
+        return {{before, press, screen:await screen}};
+    """)
+    pulse = events("pulse")
+    pressed, = events("pulse-press")
+    assert [event["visible"] for event in pulse] == [True, False], pulse
+    assert pulse[1]["time"] - pulse[0]["time"] >= .4, pulse
+
+    manifest = observation(reply, content)
+    items = [(index, item) for index, image in enumerate(manifest["images"]) for item in image]
+    kinds = [item["kind"] for _, item in items]
+    assert all(len(item["tiles"]) == 1 for _, item in items), items
+    tiles = [(index, item["tiles"][0]) for index, item in items]
+    assert kinds == ["keyframe", "keyframe", "viewport"], (kinds, manifest["frames"])
+    assert len(manifest["frames"]) == 3, manifest["frames"]
+    assert any(len(image) > 1 for image in manifest["images"]), kinds
+
+    pngs = png_attachments(content)
+    points = []
+    for (index, tile), frame in zip(tiles, manifest["frames"]):
+        assert tile["desktopRect"] == region, tile
+        assert (tile["firstAtMs"], tile["lastAtMs"]) == (frame["firstAtMs"], frame["lastAtMs"]), tile
+        assert tile["firstAtMs"] <= tile["atMs"] <= tile["lastAtMs"], tile
+        assert tile["lastAtMs"] > tile["firstAtMs"], tile
+        x, y, w, h = (tile["imageRect"][key] for key in ("x", "y", "width", "height"))
+        attachment = index + manifest["imageOffset"]
+        width, height = screenshot(content, attachment)
+        assert 0 <= x <= width - w and 0 <= y <= height - h, tile
+        assert w >= region["width"] and h >= region["height"], tile
+        for dx, dy in ((9, 9), (71, 9), (9, 67), (71, 67), (40, 38)):
+            points.append([attachment, x + dx * w // region["width"], y + dy * h // region["height"]])
+
+    a, b, final_a = (tile for _, tile in tiles)
+    assert a["firstAtMs"] == reply["result"]["before"]["atMs"], a
+    assert a["lastAtMs"] < b["firstAtMs"] < b["lastAtMs"] < final_a["firstAtMs"], tiles
+    # The fixture logs both transitions relative to the same AX press that the MCP timed.
+    sent_at = reply["result"]["press"]["sentAtMs"]
+    for earlier, later, event in zip((a, b), (b, final_a), pulse):
+        changed_at = sent_at + (event["time"] - pressed["time"]) * 1000
+        assert earlier["lastAtMs"] <= changed_at + interval_ms, (earlier, changed_at)
+        assert later["firstAtMs"] >= changed_at - interval_ms, (later, changed_at)
+    viewport = manifest["viewport"]
+    index, _ = tiles[-1]
+    assert viewport["imageIndex"] == index, viewport
+    assert viewport["imageRect"] == final_a["imageRect"] and viewport["desktopRect"] == region, viewport
+    assert viewport["atMs"] == final_a["atMs"] == final_a["lastAtMs"], viewport
+
+    colors = json.loads(subprocess.check_output(
+        [fixture_binary, "--sample-pngs"],
+        input=json.dumps({"pngs": [png["data"] for png in pngs], "points": points}).encode(),
+    ))
+    red, green, blue = (255, 0, 0), (0, 255, 0), (0, 0, 255)
+    white, black = (255, 255, 255), (0, 0, 0)
+    expected = [rgb for marker in (white, black, white) for rgb in (red, green, red, blue, marker)]
+    assert len(colors) == len(expected) and all(
+        max(abs(channel - target) for channel, target in zip(rgb, expected_rgb)) <= 64
+        for rgb, expected_rgb in zip(colors, expected)
+    ), (colors, expected)
+    print("desktop local change preserved three complete frames and the final viewport", flush=True)
+
+
 def desktop(client, fixture, fixture_binary, log_path):
     def events(kind):
         if not log_path.exists():
@@ -134,9 +209,10 @@ def desktop(client, fixture, fixture_binary, log_path):
         return [e for e in json.loads(log_path.read_text()) if e["kind"] == kind]
 
     end = time.monotonic() + 8
-    while time.monotonic() < end and not events("ready"):
+    while not (ready_events := events("ready")) and time.monotonic() < end:
         time.sleep(.05)
-    ready = events("ready")[0]
+    assert ready_events, "AppKit fixture did not start. Run --desktop in an active, unlocked desktop session."
+    ready, = ready_events
     x, y, pid = ready["x"], ready["y"], fixture.pid
     window_id = ready["windowId"]
 
@@ -158,6 +234,8 @@ def desktop(client, fixture, fixture_binary, log_path):
         time.sleep(.1)
     assert ui["window"]["windowId"] == window_id, window_id
     print("desktop display and window capture passed", flush=True)
+    local_screen_change(client, fixture_binary, pid, ready["pulseRegion"], events)
+    assert desktop_state() == before, "Background observation changed foreground or hardware cursor"
     region = {"region": {"x": x + 12, "y": y + 70, "width": 360, "height": 450}}
     reply, content = client.run(f"""
         const screen = observeScreen({{

@@ -72,11 +72,27 @@ impl Desktop {
                 _ = cancel.cancelled() => return Err("Screen observation was cancelled".into()),
                 _ = sleep_until(capture_at) => {}
             }
+            let before = if observation.preserve_input_boundaries {
+                self.input.observation_epoch()
+            } else {
+                Some(0)
+            };
             let request = target;
             let frame = blocking(move || request.capture()).await?;
+            let input_epoch = if observation.preserve_input_boundaries
+                && before != self.input.observation_epoch()
+            {
+                None
+            } else {
+                before
+            };
             let at = Instant::from_std(frame.captured_at());
             let at_ms = at.duration_since(self.clock).as_secs_f64() * 1000.0;
-            frames.push(TimedFrame { frame, at_ms });
+            frames.push(TimedFrame {
+                frame,
+                at_ms,
+                input_epoch,
+            });
 
             if let Some(started) = started.take() {
                 let _ = started.send(Ok(json!({"atMs": at_ms})));
@@ -134,11 +150,15 @@ impl selvedge_script_server::Desktop for Desktop {
                 let clock = self.clock;
                 self.input
                     .exclusive(blocking(move || {
-                        let pid = selvedge_macos_ax::insert_text(
+                        let (pid, delivery) = selvedge_macos_ax::insert_text(
                             &options,
                             selvedge_macos_input::insert_text,
                         )?;
-                        Ok(json!({"pid": pid, "sentAtMs": clock.elapsed().as_secs_f64() * 1000.0}))
+                        Ok(json!({
+                            "pid": pid,
+                            "delivery": delivery,
+                            "sentAtMs": clock.elapsed().as_secs_f64() * 1000.0,
+                        }))
                     }))
                     .await?
             }
@@ -170,6 +190,8 @@ struct Observation {
     duration_ms: f64,
     interval_ms: Option<f64>,
     image_budget: Option<usize>,
+    #[serde(default)]
+    preserve_input_boundaries: bool,
 }
 
 impl Observation {

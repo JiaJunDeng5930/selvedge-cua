@@ -80,8 +80,8 @@ Definition capture_batch {Sample Target} (target_of : Sample -> Target)
     specific to the task and consumer: if the model misses a required
     label or control at that size, its calibration is refuted.
 
-    Compare layouts that carry the same ordered evidence. Count image
-    tokens using the consumer's rule on the actual attachments. Some
+    Compare layouts that satisfy the same task obligations, including
+    the order and provenance of the selected evidence. Count image tokens using the consumer's rule on the actual attachments. Some
     models charge a fixed amount per image plus a tile cost; others
     use patch accounting. Neither the encoder nor the layout supplies
     its own price.
@@ -90,6 +90,12 @@ Module ImageLayout.
   Record Rectangle := {
     left : nat; top : nat; width : nat; height : nat
   }.
+
+  Definition contains_point r x y : Prop :=
+    left r <= x < left r + width r /\ top r <= y < top r + height r.
+
+  Definition disjoint a b : Prop :=
+    forall x y, contains_point a x y -> ~ contains_point b x y.
 
   Record Detail := {
     source_detail_region : Rectangle;
@@ -113,7 +119,11 @@ Module ImageLayout.
   Definition layout_evidence {Evidence Image} (attachments : list (Attachment Evidence Image)) :=
     flat_map (fun attachment => map source (tiles attachment)) attachments.
 
-  (** Consumers supply dimensions and token costs. Rendering and
+  (** The task supplies expected answers and the source details it
+      needs. The consumer independently observes the image region and
+      interprets it, after preprocessing. Its result must answer the
+      task even if all requested detail dimensions happen to fit.
+      Consumers also supply accepted formats, request size and token costs. Rendering and
       measurement are independent observations of the decoded image,
       in the same coordinate space. A successful rendering represents
       the entire requested evidence in its region and preserves its
@@ -123,13 +133,25 @@ Module ImageLayout.
     represents : Evidence -> Image -> Rectangle -> Prop;
     required_details : Evidence -> list Detail;
     measure_detail : Evidence -> Image -> Rectangle -> Detail -> option (nat * nat);
-    image_tokens : Image -> nat
+    Visual : Type;
+    Answer : Type;
+    observed_region : Image -> Rectangle -> Visual;
+    expected_answer : Evidence -> Answer;
+    interpret_region : Visual -> option Answer;
+    accepted_images : list Image -> Prop;
+    image_tokens : Image -> nat;
+    metadata_tokens : list (Attachment Evidence Image) -> nat
   }.
   Arguments image_extent {Evidence Image} _ _.
   Arguments represents {Evidence Image} _ _ _ _.
   Arguments required_details {Evidence Image} _ _.
   Arguments measure_detail {Evidence Image} _ _ _ _ _.
+  Arguments observed_region {Evidence Image} _ _ _.
+  Arguments expected_answer {Evidence Image} _ _.
+  Arguments interpret_region {Evidence Image} _ _.
+  Arguments accepted_images {Evidence Image} _ _.
   Arguments image_tokens {Evidence Image} _ _.
+  Arguments metadata_tokens {Evidence Image} _ _.
 
   Section Layouts.
     Context {Evidence Image : Type}.
@@ -145,25 +167,73 @@ Module ImageLayout.
       let '(w,h) := image_extent profile im in
       0 < width r /\ 0 < height r /\ left r + width r <= w /\ top r + height r <= h /\
       represents profile (source tile) im r /\
-      Forall (readable im tile) (required_details profile (source tile)).
+      Forall (readable im tile) (required_details profile (source tile)) /\
+      interpret_region profile (observed_region profile im r) =
+        Some (expected_answer profile (source tile)).
 
+    (** A report cannot assign two distinct tiles to the same visible
+        pixel. This makes provenance unambiguous without relying on an
+        encoder's interpretation of overlapping regions. *)
     Definition valid_attachment (attachment : Attachment Evidence Image) : Prop :=
-      tiles attachment <> [] /\ Forall (valid_tile (image attachment)) (tiles attachment).
+      tiles attachment <> [] /\
+      Forall (valid_tile (image attachment)) (tiles attachment) /\
+      ForallOrdPairs (fun a b => disjoint (region a) (region b)) (tiles attachment).
 
-    Definition usable budget (evidence : list Evidence) (layout : Layout) : Prop :=
-      length layout <= budget /\ layout_evidence layout = evidence /\
-      Forall valid_attachment layout.
+    Definition admissible budget (accepts : list Evidence -> Prop) (layout : Layout) : Prop :=
+      length layout <= budget /\ accepts (layout_evidence layout) /\
+      Forall valid_attachment layout /\ accepted_images profile (map image layout).
+
+    Definition usable budget (evidence : list Evidence) : Layout -> Prop :=
+      admissible budget (fun rendered => rendered = evidence).
+
+    Theorem collapsed_views_cannot_both_answer_task im a b :
+      observed_region profile im (region a) = observed_region profile im (region b) ->
+      expected_answer profile (source a) <> expected_answer profile (source b) ->
+      ~ (valid_tile im a /\ valid_tile im b).
+    Proof.
+      intros visually_same different [A B].
+      unfold valid_tile in A, B. destruct (image_extent profile im) as [w h].
+      destruct A as [_ [_ [_ [_ [_ [_ A]]]]]].
+      destruct B as [_ [_ [_ [_ [_ [_ B]]]]]].
+      congruence.
+    Qed.
+
+    Lemma disjoint_tiles_have_unique_location (ts : list (Tile Evidence)) a b x y :
+      ForallOrdPairs (fun a b => disjoint (region a) (region b)) ts ->
+      In a ts -> In b ts -> contains_point (region a) x y ->
+      contains_point (region b) x y -> a = b.
+    Proof.
+      intros pairs. induction pairs as [|first rest disjoint_rest pairs IH].
+      - simpl. tauto.
+      - intros [<- | Ha] [<- | Hb] Aa Bb; try reflexivity; try now apply IH.
+        + rewrite Forall_forall in disjoint_rest.
+          exfalso. exact (disjoint_rest b Hb x y Aa Bb).
+        + rewrite Forall_forall in disjoint_rest.
+          exfalso. exact (disjoint_rest a Ha x y Bb Aa).
+    Qed.
 
     Definition cost (layout : Layout) :=
+      metadata_tokens profile layout +
       fold_right (fun attachment sum => image_tokens profile (image attachment) + sum) 0 layout.
 
     Definition no_more_expensive (a b : Layout) : Prop :=
       cost a < cost b \/ (cost a = cost b /\ length a <= length b).
 
-    Definition optimal budget evidence (layout : Layout) : Prop :=
-      usable budget evidence layout /\
-      forall alternative, usable budget evidence alternative ->
+    Definition best_for budget accepts (layout : Layout) : Prop :=
+      admissible budget accepts layout /\
+      forall alternative, admissible budget accepts alternative ->
         no_more_expensive layout alternative.
+
+    Definition optimal budget evidence : Layout -> Prop :=
+      best_for budget (fun rendered => rendered = evidence).
+
+    Theorem acceptable_cheaper_report_rules_out_waste budget accepts (layout alternative : Layout) :
+      admissible budget accepts alternative ->
+      cost alternative < cost layout -> ~ best_for budget accepts layout.
+    Proof.
+      intros acceptable cheaper [_ best].
+      specialize (best alternative acceptable). unfold no_more_expensive in best. lia.
+    Qed.
 
     Theorem readable_packing_rules_out_separate budget evidence (separate packed : Layout) :
       usable budget evidence packed ->
@@ -181,30 +251,35 @@ Module ImageLayout.
       ~ readable (image attachment) tile detail ->
       ~ usable budget evidence layout.
     Proof.
-      intros Ha Ht Hd unreadable [_ [_ accepted]].
+      intros Ha Ht Hd unreadable [_ [_ [accepted _]]].
       rewrite Forall_forall in accepted. specialize (accepted _ Ha).
-      destruct accepted as [_ accepted].
+      destruct accepted as [_ [accepted _]].
       rewrite Forall_forall in accepted. specialize (accepted _ Ht).
       unfold valid_tile in accepted.
       destruct (image_extent profile (image attachment)) as [w h].
-      destruct accepted as [_ [_ [_ [_ [_ accepted]]]]].
+      destruct accepted as [_ [_ [_ [_ [_ [accepted _]]]]]].
       rewrite Forall_forall in accepted. auto.
     Qed.
 
     Definition variable_cost (charge : Image -> nat) (layout : Layout) :=
+      metadata_tokens profile layout +
       fold_right (fun attachment sum => charge (image attachment) + sum) 0 layout.
 
     Lemma cost_with_fixed_charge base charge :
       (forall im, image_tokens profile im = base + charge im) ->
       forall layout, cost layout = base * length layout + variable_cost charge layout.
     Proof.
-      intros charge_rule layout. induction layout as [|attachment rest IH]; simpl; [lia|].
-      rewrite charge_rule, IH. lia.
+      intros charge_rule layout.
+      assert (images : forall (ls : Layout),
+        fold_right (fun a sum => image_tokens profile (image a) + sum) 0 ls =
+        base * length ls + fold_right (fun a sum => charge (image a) + sum) 0 ls).
+      { induction ls as [|attachment rest IH]; simpl; [lia|]. rewrite charge_rule, IH. lia. }
+      unfold cost, variable_cost. rewrite images. lia.
     Qed.
 
-    (** The variable cost can rise after packing, for instance because
-        of padding or tile rounding. The fixed charge saved must cover
-        that increase; equal total cost favors fewer attachments. *)
+    (** The variable cost includes padding, tile rounding and the
+        metadata the model reads. The fixed charge saved must cover
+        any increase; equal total cost favors fewer attachments. *)
     Theorem packing_cost_threshold base charge (separate packed : Layout) :
       (forall im, image_tokens profile im = base + charge im) ->
       length packed <= length separate ->
@@ -219,14 +294,14 @@ Module ImageLayout.
 
   Definition delivered {Evidence Image} (profile : Profile Evidence Image)
       budget (accepts : list Evidence -> Prop) (layout : list (Attachment Evidence Image)) : Prop :=
-    accepts (layout_evidence layout) /\
-    optimal profile budget (layout_evidence layout) layout.
+    best_for profile budget accepts layout.
   (** Two 512x512 frames give a concrete, falsifiable cost comparison.
       The GPT-4.1 high-detail rule charges 85 tokens per image plus
       170 per 512x512 tile. These sizes are within the documented
       preprocessing bounds, so a horizontal join needs two tiles
       without resizing either frame. The glyph threshold below is a
-      fixture parameter, not a general minimum for model legibility. *)
+      fixture parameter, not a general minimum for model legibility.
+      This fixture holds metadata cost fixed across layouts. *)
   Module LayoutExample.
     Inductive Frame := A | B.
     Inductive Image := Separate (frame : Frame) | Joined | Shrunk.
@@ -254,7 +329,19 @@ Module ImageLayout.
          required_details := fun _ => [glyph];
          measure_detail := fun _ im _ _ =>
            match im with Shrunk => Some (6,6) | _ => Some (12,12) end;
-         image_tokens := fun im => match im with Joined => 425 | _ => 255 end |}.
+         Visual := option Frame;
+         Answer := Frame;
+         observed_region := fun im r =>
+           match im with
+           | Separate frame => Some frame
+           | Joined => if Nat.eqb (left r) 0 then Some A else Some B
+           | Shrunk => None
+           end;
+         expected_answer := fun frame => frame;
+         interpret_region := fun observed => observed;
+         accepted_images := fun _ => True;
+         image_tokens := fun im => match im with Joined => 425 | _ => 255 end;
+         metadata_tokens := fun _ => 0 |}.
 
     Definition tile frame r : Tile Frame := {| source := frame; region := r |}.
     Definition attachment im ts : Attachment Frame Image := {| image := im; tiles := ts |}.
@@ -267,19 +354,18 @@ Module ImageLayout.
       im <> Shrunk -> readable example_profile im tile glyph.
     Proof. destruct im; intros different; [| |contradiction]; exists 12, 12; cbn; repeat split; lia. Qed.
 
+    Local Ltac check_example_layout :=
+      unfold usable, admissible, separate, joined; cbn;
+      repeat (first [apply Forall_nil | apply Forall_cons | constructor 1 | constructor 2 | split]);
+      cbn in *; try reflexivity; try lia; try discriminate;
+      first [apply glyph_is_readable; discriminate
+            | unfold disjoint, contains_point; cbn; intros; lia].
+
     Lemma separate_images_are_usable : usable example_profile 2 [A; B] separate.
-    Proof.
-      repeat (first [apply Forall_nil | apply Forall_cons | split]);
-        cbn in *; try lia; try discriminate; try reflexivity;
-        apply glyph_is_readable; discriminate.
-    Qed.
+    Proof. check_example_layout. Qed.
 
     Lemma joined_image_is_usable : usable example_profile 2 [A; B] joined.
-    Proof.
-      repeat (first [apply Forall_nil | apply Forall_cons | split]);
-        cbn in *; try lia; try discriminate; try reflexivity;
-        apply glyph_is_readable; discriminate.
-    Qed.
+    Proof. check_example_layout. Qed.
 
     Example readable_join_saves_one_fixed_charge :
       cost example_profile separate = cost example_profile joined + 85 /\
@@ -287,7 +373,7 @@ Module ImageLayout.
     Proof.
       split; [reflexivity |].
       apply (readable_packing_rules_out_separate _ _ _ _ joined);
-        [exact joined_image_is_usable | simpl; lia | simpl; lia].
+        [exact joined_image_is_usable | simpl; lia | change (425 <= 510); lia].
     Qed.
 
     Example unusable_join_leaves_a_readable_separate_option :
@@ -320,7 +406,7 @@ Definition valid_window {Image} (window : ObservationWindow Image) : Prop :=
     Forall (fun f => at_tick f <= delivered_at window) (captured window).
 
 Section Screen.
-  Context {Target Raster LocalPoint DesktopPoint : Type}.
+  Context {Target Raster DesktopPoint : Type}.
 
   (** A capture's identity includes its target and geometry.  Equal
       pixels alone need not imply the same point is actionable.  Desktop
@@ -328,12 +414,16 @@ Section Screen.
       target and display geometry when needed for correct routing. *)
   Record Capture := {
     capture_target : Target;
+    capture_ordinal : nat;
     pixels : Raster;
-    desktop_point : LocalPoint -> option DesktopPoint
+    raster_extent : nat * nat;
+    desktop_point : (nat * nat) -> option DesktopPoint
   }.
   Definition Frame := Timed Capture.
 
-  Definition captured_for := capture_batch capture_target.
+  Definition captured_for target start finish frames :=
+    capture_batch capture_target target start finish frames /\
+    NoDup (map (fun frame => capture_ordinal (value frame)) frames).
 
   Definition one_shot (frame : Frame) (frames : list Frame) : Prop :=
     frames = [frame].
@@ -342,7 +432,7 @@ Section Screen.
     captured_for target start finish frames -> one_shot frame frames ->
     capture_target (value frame) = target /\ start <= at_tick frame <= finish.
   Proof.
-    intros [_ [_ H]] ->. now inversion H.
+    intros [[_ [_ H]] _] ->. now inversion H.
   Qed.
 
   (** A current picture is the last actual capture. Historical images
@@ -362,30 +452,9 @@ Section Screen.
       composition or position metadata; layout coordinates alone lack
       the capture's time and coordinate transform. *)
   Definition point_evidence (frames : list Frame) (tick : Tick)
-      (source : Frame) (point : LocalPoint) (destination : DesktopPoint) : Prop :=
+      (source : Frame) (point : nat * nat) (destination : DesktopPoint) : Prop :=
     In source frames /\ tick = at_tick source /\
     desktop_point (value source) point = Some destination.
-
-  Definition delivered_point {Evidence Image}
-      (source_point : Evidence -> Image -> ImageLayout.Rectangle ->
-                      LocalPoint -> option (Frame * LocalPoint))
-      (frames : list Frame) (layout : list (ImageLayout.Attachment Evidence Image))
-      attachment tile displayed tick frame local destination : Prop :=
-    In attachment layout /\ In tile (ImageLayout.tiles attachment) /\
-    source_point (ImageLayout.source tile) (ImageLayout.image attachment)
-      (ImageLayout.region tile) displayed = Some (frame, local) /\
-    point_evidence frames tick frame local destination.
-
-  (** The point inverse is established by the image renderer. A tile's
-      apparent position cannot replace the capture-time desktop transform. *)
-  Theorem delivered_position_has_capture_provenance {Evidence Image}
-      (source_point : Evidence -> Image -> ImageLayout.Rectangle ->
-                      LocalPoint -> option (Frame * LocalPoint))
-      frames layout attachment tile displayed tick frame local destination :
-    delivered_point source_point frames layout attachment tile displayed tick frame local destination ->
-    In frame frames /\ tick = at_tick frame /\
-    desktop_point (value frame) local = Some destination.
-  Proof. unfold delivered_point, point_evidence. tauto. Qed.
 
   Theorem geometry_matters (a b : Frame) point x y :
     desktop_point (value a) point = Some x ->
@@ -426,17 +495,40 @@ Section Screen.
     representative : Frame
   }.
 
-  Inductive full_history (same : Capture -> Capture -> Prop) :
+  (** Full-frame tiles preserve the position relative to their source
+      raster, even after translation or scaling. Every tile pixel
+      resolves through that raster and the representative capture's
+      local-to-desktop transform. *)
+  Definition FullFrameCoordinates :=
+    nat -> nat -> nat -> option (Tick * DesktopPoint).
+
+  Definition full_coordinates_faithful {Image}
+      (coordinates : FullFrameCoordinates)
+      (layout : list (ImageLayout.Attachment FullInterval Image)) : Prop :=
+    forall index attachment tile x y,
+      nth_error layout index = Some attachment ->
+      In tile (ImageLayout.tiles attachment) ->
+      ImageLayout.contains_point (ImageLayout.region tile) x y ->
+      let frame := representative (ImageLayout.source tile) in
+      let rect := ImageLayout.region tile in
+      let '(w,h) := raster_extent (value frame) in
+      let sx := (x - ImageLayout.left rect) * w / ImageLayout.width rect in
+      let sy := (y - ImageLayout.top rect) * h / ImageLayout.height rect in
+      exists destination,
+        desktop_point (value frame) (sx,sy) = Some destination /\
+        coordinates index x y = Some (at_tick frame, destination).
+
+  Inductive full_history (same : Frame -> Frame -> Prop) :
       list Frame -> list FullInterval -> Prop :=
   | single_sample : forall f,
       full_history same [f] [{| first_sample := f; representative := f |}]
   | unchanged_sample : forall f next rest interval history,
-      same (value f) (value next) ->
+      same f next ->
       full_history same (next :: rest) (interval :: history) ->
       full_history same (f :: next :: rest)
         ({| first_sample := f; representative := representative interval |} :: history)
   | changed_sample : forall f next rest history,
-      ~ same (value f) (value next) ->
+      ~ same f next ->
       full_history same (next :: rest) history ->
       full_history same (f :: next :: rest)
         ({| first_sample := f; representative := f |} :: history).
@@ -447,14 +539,24 @@ Section Screen.
       may move by the time the script uses the coordinates. *)
   Definition complete_evidence {Answer} (decide : Capture -> Answer)
       (frames : list Frame) final (evidence : list FullInterval) : Prop :=
-    full_history (decision_equivalent decide) frames evidence /\ current_view frames final /\
+    full_history (fun a b => decision_equivalent decide (value a) (value b)) frames evidence /\ current_view frames final /\
     exists earlier last, evidence = earlier ++ [last] /\ representative last = final.
 
+  (** Layout and history selection answer the same task. The task
+      decision must be recoverable from the expected answer on a tile;
+      the consumer cannot replace a changed-state question with a
+      constant answer just to satisfy the layout checks. *)
+  Definition layout_covers_decision {Image Answer}
+      (profile : ImageLayout.Profile FullInterval Image) (decide : Capture -> Answer) : Prop :=
+    exists extract, forall span,
+      extract (ImageLayout.expected_answer profile span) = decide (value (representative span)).
+
   Definition complete_screen_report {Image Answer}
-      (profile : ImageLayout.Profile FullInterval Image) (decide : Capture -> Answer)
-      target start finish budget frames final layout : Prop :=
-    captured_for target start finish frames /\
-    ImageLayout.delivered profile budget (complete_evidence decide frames final) layout.
+      (profile : ImageLayout.Profile FullInterval Image) (coordinates : FullFrameCoordinates)
+      (decide : Capture -> Answer) target start finish budget frames final layout : Prop :=
+    captured_for target start finish frames /\ layout_covers_decision profile decide /\
+    ImageLayout.delivered profile budget (complete_evidence decide frames final) layout /\
+    full_coordinates_faithful coordinates layout.
 
   (** The distinct local state must be visible as an entire capture.
       Here A and B have different answers to a task-relevant question;
@@ -470,7 +572,7 @@ Section Screen.
   Proof. now inversion 1. Qed.
 
   Lemma full_history_unchanged same f next rest result :
-    same (value f) (value next) ->
+    same f next ->
     full_history same (f :: next :: rest) result ->
     exists prior history,
       full_history same (next :: rest) (prior :: history) /\
@@ -478,30 +580,30 @@ Section Screen.
   Proof. intros equivalent H. inversion H; subst; try contradiction. eauto. Qed.
 
   Lemma full_history_changed same f next rest result :
-    ~ same (value f) (value next) ->
+    ~ same f next ->
     full_history same (f :: next :: rest) result ->
     exists history, full_history same (next :: rest) history /\
       result = interval f f :: history.
   Proof. intros different H. inversion H; subst; try contradiction. eauto. Qed.
 
   Theorem transient_keeps_full_a_b_a {Image Answer}
-      (profile : ImageLayout.Profile FullInterval Image) (decide : Capture -> Answer)
-      a1 a2 a3 b a5 target start finish budget final layout :
+      (profile : ImageLayout.Profile FullInterval Image) (coordinates : FullFrameCoordinates)
+      (decide : Capture -> Answer) a1 a2 a3 b a5 target start finish budget final layout :
     decision_equivalent decide (value a1) (value a2) ->
     decision_equivalent decide (value a2) (value a3) ->
     decision_equivalent decide (value a3) (value a5) ->
     ~ decision_equivalent decide (value a3) (value b) ->
-    complete_screen_report profile decide target start finish budget [a1; a2; a3; b; a5] final layout ->
+    complete_screen_report profile coordinates decide target start finish budget [a1; a2; a3; b; a5] final layout ->
     ImageLayout.layout_evidence layout = [interval a1 a3; interval b b; interval a5 a5].
   Proof.
-    intros H12 H23 H35 Hd [_ [[H _] _]].
-    destruct (full_history_unchanged (decision_equivalent decide) _ _ _ _ H12 H) as (u & uh & Hu & ->).
-    destruct (full_history_unchanged (decision_equivalent decide) _ _ _ _ H23 Hu) as (v & vh & Hv & EqV).
-    destruct (full_history_changed (decision_equivalent decide) _ _ _ _ Hd Hv) as (w & Hw & EqW).
+    intros H12 H23 H35 Hd [_ [_ [[[_ [[H _] _]] _] _]]].
+    destruct (full_history_unchanged (fun a b => decision_equivalent decide (value a) (value b)) _ _ _ _ H12 H) as (u & uh & Hu & ->).
+    destruct (full_history_unchanged (fun a b => decision_equivalent decide (value a) (value b)) _ _ _ _ H23 Hu) as (v & vh & Hv & EqV).
+    destruct (full_history_changed (fun a b => decision_equivalent decide (value a) (value b)) _ _ _ _ Hd Hv) as (w & Hw & EqW).
     assert (~ decision_equivalent decide (value b) (value a5)) as Hb.
     { unfold decision_equivalent in *. congruence. }
-    destruct (full_history_changed (decision_equivalent decide) _ _ _ _ Hb Hw) as (z & Hz & ->).
-    rewrite (full_history_single (decision_equivalent decide) _ _ Hz) in EqW.
+    destruct (full_history_changed (fun a b => decision_equivalent decide (value a) (value b)) _ _ _ _ Hb Hw) as (z & Hz & ->).
+    rewrite (full_history_single (fun a b => decision_equivalent decide (value a) (value b)) _ _ Hz) in EqW.
     inversion EqW; subst.
     inversion EqV; subst. reflexivity.
   Qed.
@@ -548,8 +650,130 @@ Section Screen.
       (profile : ImageLayout.Profile Frame Image) important target start finish budget frames final layout f :
     animation_report profile important target start finish budget frames final layout ->
     In f frames -> important f -> In f (ImageLayout.layout_evidence layout).
-  Proof. intros [_ [[_ [keep _]] _]]. exact (keep f). Qed.
+  Proof. intros [_ [[_ [[_ [keep _]] _]] _]]. exact (keep f). Qed.
 End Screen.
+
+(** A complete observation is attainable. The two states in this
+    finite fixture each have one task-relevant pixel. A three-pixel
+    attachment contains the three full views, with their three
+    separate time intervals. This witness exercises the formal report
+    contract. Real screenshot dimensions and token costs are tested
+    separately by the layout example. *)
+Module TransientObservationExample.
+  Local Abbreviation Snapshot := (@Capture unit bool unit).
+  Local Abbreviation Sample := (Timed Snapshot).
+  Local Abbreviation Span := (@FullInterval unit bool unit).
+  Definition sample time color : Sample :=
+    {| at_tick := time;
+       value := {| capture_target := tt; capture_ordinal := time; pixels := color; raster_extent := (1, 1); desktop_point := fun _ => Some tt |} |}.
+  Definition a1 := sample 1 false.
+  Definition a2 := sample 2 false.
+  Definition a3 := sample 3 false.
+  Definition b := sample 4 true.
+  Definition a5 := sample 5 false.
+  Definition captures := [a1; a2; a3; b; a5].
+  Definition state (capture : Snapshot) := pixels capture.
+  Definition span_state (span : Span) := state (value (representative span)).
+  Definition area column : ImageLayout.Rectangle :=
+    {| ImageLayout.left := column; ImageLayout.top := 0;
+       ImageLayout.width := 1; ImageLayout.height := 1 |}.
+  Definition pixel_at (image : list bool) (rect : ImageLayout.Rectangle) :=
+    nth_error image (ImageLayout.left rect).
+  Definition detail : ImageLayout.Detail :=
+    {| ImageLayout.source_detail_region := area 0;
+       ImageLayout.minimum_width := 1; ImageLayout.minimum_height := 1 |}.
+
+  Definition profile : ImageLayout.Profile Span (list bool) :=
+    {| ImageLayout.image_extent := fun image => (length image, 1);
+       ImageLayout.represents := fun span image rect => pixel_at image rect = Some (span_state span);
+       ImageLayout.required_details := fun _ => [detail];
+       ImageLayout.measure_detail := fun _ image rect _ =>
+         match pixel_at image rect with Some _ => Some (1,1) | None => None end;
+       ImageLayout.Visual := option bool;
+       ImageLayout.Answer := bool;
+       ImageLayout.observed_region := pixel_at;
+       ImageLayout.expected_answer := span_state;
+       ImageLayout.interpret_region := fun observed => observed;
+       ImageLayout.accepted_images := fun _ => True;
+       ImageLayout.image_tokens := fun _ => 1;
+       ImageLayout.metadata_tokens := fun _ => 0 |}.
+
+  Definition coordinates : @FullFrameCoordinates unit :=
+    fun _ x _ =>
+      match x with
+      | 0 => Some (3, tt)
+      | 1 => Some (4, tt)
+      | 2 => Some (5, tt)
+      | _ => None
+      end.
+
+  Definition tile span column : ImageLayout.Tile Span :=
+    {| ImageLayout.source := span; ImageLayout.region := area column |}.
+  Definition packed : list (ImageLayout.Attachment Span (list bool)) :=
+    [{| ImageLayout.image := [false; true; false];
+        ImageLayout.tiles :=
+          [tile (interval a1 a3) 0; tile (interval b b) 1; tile (interval a5 a5) 2] |}].
+
+  Lemma captured_in_order : captured_for tt 1 5 captures.
+  Proof.
+    split; [|cbn; repeat constructor; cbn; intuition discriminate].
+    split; [discriminate|]. split.
+    - intros pre first middle second post order.
+      assert (index_first : nth_error captures (length pre) = Some first).
+      { rewrite order. rewrite nth_error_app2 by lia. now rewrite Nat.sub_diag. }
+      assert (index_second : nth_error captures (length pre + S (length middle)) = Some second).
+      { rewrite order. rewrite nth_error_app2 by lia.
+        replace (length pre + S (length middle) - length pre) with (S (length middle)) by lia.
+        cbn. rewrite nth_error_app2 by lia. now rewrite Nat.sub_diag. }
+      assert (time_at_index : forall index frame, nth_error captures index = Some frame ->
+        at_tick frame = S index).
+      { intros [|[|[|[|[|index]]]]] frame found; cbn in found;
+          try (inversion found; reflexivity).
+        destruct index; discriminate. }
+      rewrite (time_at_index _ _ index_first), (time_at_index _ _ index_second). lia.
+    - repeat constructor; simpl; lia.
+  Qed.
+
+  Lemma packed_is_admissible :
+    ImageLayout.admissible profile 3 (complete_evidence state captures a5) packed.
+  Proof.
+    split; [cbn; lia|]. split.
+    - apply transient_evidence_is_feasible; unfold decision_equivalent; cbn; congruence.
+    - split; [|exact I]. unfold packed. constructor 2; [|constructor].
+      unfold ImageLayout.valid_attachment. cbn.
+      split; [discriminate|]. split.
+      + repeat (first [apply Forall_nil | apply Forall_cons]);
+          unfold ImageLayout.valid_tile; cbn; repeat split; try reflexivity; try lia;
+          repeat (first [apply Forall_nil | apply Forall_cons]);
+          exists 1,1; cbn; repeat split; lia.
+      + repeat (first [apply Forall_nil | apply Forall_cons | constructor 1 | constructor 2]);
+          unfold ImageLayout.disjoint, ImageLayout.contains_point; cbn; intros; lia.
+  Qed.
+
+  Example a_a_a_b_a_has_a_readable_economical_report :
+    complete_screen_report profile coordinates state tt 1 5 3 captures a5 packed.
+  Proof.
+    split; [exact captured_in_order|]. split; [now exists (fun result => result)|].
+    split.
+    2: { intros [|index] attachment t x y attached inside bounds.
+         2: { cbn in attached. destruct index; discriminate. }
+         cbn in attached. inversion attached; subst attachment.
+         cbn in inside. destruct inside as [<-|[<-|[<-|[]]]];
+           cbn in bounds; exists tt; split; try reflexivity;
+           unfold ImageLayout.contains_point in bounds; cbn in bounds;
+           first [replace x with 0 by lia | replace x with 1 by lia | replace x with 2 by lia];
+           reflexivity. }
+    split; [exact packed_is_admissible|].
+    intros [|first more] [_ [evidence _]].
+    - cbn in evidence. destruct evidence as [history _]. inversion history.
+    - unfold ImageLayout.no_more_expensive, ImageLayout.cost. cbn.
+      assert (tokens : forall attachments : list (ImageLayout.Attachment Span (list bool)),
+        fold_right (fun _ sum => S sum) 0 attachments = length attachments).
+      { induction attachments; simpl; congruence. }
+      rewrite tokens. destruct more; simpl; [right; split; lia | left; lia].
+  Qed.
+End TransientObservationExample.
+
 
 (** Aligned scrolling content is a union of observed locations.
     Source points describe the exact frame, geometry, and capture time.
@@ -589,12 +813,24 @@ Section Scroll.
       true final viewport share one budget. Metadata attaches a scroll
       tile to its source observations and a full tile to one full frame.
       The latter is also the coordinate source for the final viewport. *)
-  Inductive Tile := Full (frame : SampleFrame) | Mosaic (content : ContentPoint -> option Pixel).
+  Record ScrollMosaic := {
+    content : ContentPoint -> option Pixel;
+    origin : ContentPoint -> option (SampleFrame * LocalPoint)
+  }.
+
+  Definition valid_origin frames mosaic : Prop :=
+    forall point pixel, content mosaic point = Some pixel ->
+      exists frame local, origin mosaic point = Some (frame, local) /\
+        In frame frames /\ content_point frame local = Some point /\
+        read_pixel frame local = Some pixel.
+
+  Inductive Tile := Full (frame : SampleFrame) | Mosaic (scroll : ScrollMosaic).
 
   Definition mixed_evidence (required_full : SampleFrame -> Prop) frames scroll_samples
-      (mosaic : ContentPoint -> option Pixel) final evidence : Prop :=
+      (mosaic : ScrollMosaic) final evidence : Prop :=
     scroll_samples <> [] /\ in_order scroll_samples frames /\
-    (exists point pixel, mosaic point = Some pixel) /\ mosaic_of scroll_samples mosaic /\
+    (exists point pixel, content mosaic point = Some pixel) /\
+    mosaic_of scroll_samples (content mosaic) /\ valid_origin scroll_samples mosaic /\
     In (Mosaic mosaic) evidence /\
     Forall (fun tile => match tile with
       | Full frame => In frame frames
@@ -614,12 +850,27 @@ Section Scroll.
     ImageLayout.delivered profile budget
       (mixed_evidence required_full frames scroll_samples mosaic final) layout.
 
+  Theorem delivered_scroll_point_identifies_capture {Image}
+      (profile : ImageLayout.Profile Tile Image) required_full target start finish budget
+      frames scroll_samples mosaic final layout point pixel :
+    mixed_report profile required_full target start finish budget frames scroll_samples mosaic final layout ->
+    content mosaic point = Some pixel ->
+    exists frame local, origin mosaic point = Some (frame, local) /\
+      In frame scroll_samples /\ content_point frame local = Some point /\
+      read_pixel frame local = Some pixel.
+  Proof.
+    intros [_ [accepted _]] captured_pixel.
+    destruct accepted as [_ [evidence _]].
+    destruct evidence as [_ [_ [_ [_ [origins _]]]]].
+    exact (origins point pixel captured_pixel).
+  Qed.
+
   Theorem mixed_report_cannot_omit_required_local_frame {Image}
       (profile : ImageLayout.Profile Tile Image) required_full target start finish budget
       frames scroll_samples mosaic final layout frame :
     mixed_report profile required_full target start finish budget frames scroll_samples mosaic final layout ->
     In frame frames -> required_full frame -> In (Full frame) (ImageLayout.layout_evidence layout).
-  Proof. unfold mixed_report, ImageLayout.delivered, mixed_evidence. firstorder. Qed.
+  Proof. unfold mixed_report, ImageLayout.delivered, ImageLayout.best_for, ImageLayout.admissible, mixed_evidence. firstorder. Qed.
 End Scroll.
 
 (** Time is part of an input request. A schedule records an intended
@@ -640,8 +891,9 @@ Theorem different_offsets_have_different_due_times {Event} start
 Proof. unfold due. lia. Qed.
 
 (** A successful dispatch accounts for every planned payload in order.
-    On interruption/failure only an acknowledged prefix may already have
-    been issued. No theorem equates platform dispatch with app response.
+    An interrupted receipt records the actual issued prefix and times,
+    including any early or late dispatch that caused the interruption.
+    A timing violation cannot erase an issued event from cleanup state. No theorem equates platform dispatch with app response.
     The clock comparison does not impose a deadline on the OS. *)
 Inductive DispatchResult (Event : Type) :=
 | issued (events : list (Timed Event))
@@ -662,7 +914,7 @@ Definition dispatch_valid {Event} start slack (plan : Intent Event)
   | issued sent => chronological sent /\ Forall2 (scheduled_pair start slack) plan sent
   | interrupted sent => chronological sent /\
       exists issued_plan pending, plan = issued_plan ++ pending /\
-        Forall2 (scheduled_pair start slack) issued_plan sent
+        Forall2 (fun planned actual => value actual = value planned) issued_plan sent
   end.
 
 Theorem successful_dispatch_cannot_omit_events {Event} start slack
@@ -685,21 +937,25 @@ Proof. unfold scheduled_pair, due. lia. Qed.
     express input; content displacement is a separate observation. *)
 Section Motion.
   Context {Position : Type}.
-  Definition follows_trajectory (position_at : Tick -> Position) duration
+  Definition bounded_sampling gap (samples : Intent Position) : Prop :=
+    forall pre a b post, samples = pre ++ a :: b :: post ->
+      at_tick b <= at_tick a + gap.
+
+  Definition follows_trajectory (position_at : Tick -> Position) duration gap
       (samples : Intent Position) : Prop :=
-    chronological samples /\
+    chronological samples /\ bounded_sampling gap samples /\
     (exists first rest, samples = first :: rest /\ at_tick first = 0) /\
     (exists last, current_view samples last /\ at_tick last = duration) /\
     Forall (fun sample => at_tick sample <= duration /\
                           value sample = position_at (at_tick sample)) samples.
 
-  Theorem final_motion_issues_the_requested_endpoint position_at duration samples sent start slack :
-    follows_trajectory position_at duration samples ->
+  Theorem final_motion_issues_the_requested_endpoint position_at duration gap samples sent start slack :
+    follows_trajectory position_at duration gap samples ->
     dispatch_valid start slack samples (issued sent) ->
     exists endpoint,
       current_view sent endpoint /\ value endpoint = position_at duration.
   Proof.
-    intros [_ [_ [(last & [prefix ->] & time) correct]]] [_ scheduled].
+    intros [_ [_ [_ [(last & [prefix ->] & time) correct]]]] [_ scheduled].
     assert (at_end : value last = position_at duration).
     { rewrite Forall_forall in correct.
       assert (In last (prefix ++ [last])) by (apply in_or_app; now right; left).
@@ -712,6 +968,14 @@ Section Motion.
     - inversion scheduled as [|x y xs ys paired tail]; subst.
       destruct (IH _ tail) as (endpoint & [prior ->] & reaches).
       exists endpoint. split; [now exists (y :: prior) | exact reaches].
+  Qed.
+
+  Theorem endpoint_only_is_too_sparse position_at duration gap first last :
+    at_tick first = 0 -> at_tick last = duration -> gap < duration ->
+    ~ follows_trajectory position_at duration gap [first; last].
+  Proof.
+    intros start end_time sparse [_ [coverage _]].
+    specialize (coverage [] first last [] eq_refl). lia.
   Qed.
 
   Record ScrollIncrement := {
@@ -735,55 +999,79 @@ Definition completed_dispatch {Event} start slack finished (plan : Intent Event)
   | issued sent | interrupted sent => Forall (fun e => at_tick e <= finished) sent
   end.
 
-(** Program order supplies the causal edges. Timestamp inequalities
-    allow ties at clock resolution. The report, not just the private
-    sample buffer, must contain enough evidence for before/after.
-    Waiting for readiness cannot force a finite window to overlap a
-    later action; that depends on the actual capture and dispatch. *)
-Definition spans_dispatch {Sample Evidence Image Event}
-    (window : ObservationWindow Sample) (profile : ImageLayout.Profile Evidence Image)
-    budget (presents : Evidence -> option (Timed Sample)) layout
-    start slack finished (plan : Intent Event) sent : Prop :=
-  valid_window window /\ ready_at window <= start /\
-  completed_dispatch start slack finished plan (issued sent) /\
-  ImageLayout.optimal profile budget (ImageLayout.layout_evidence layout) layout /\
-  exists first rest last_event prefix last_frame before_evidence after_evidence,
-    captured window = first :: rest ++ [last_frame] /\
-    sent = prefix ++ [last_event] /\ at_tick last_event <= at_tick last_frame /\
-    In before_evidence (ImageLayout.layout_evidence layout) /\ presents before_evidence = Some first /\
-    In after_evidence (ImageLayout.layout_evidence layout) /\ presents after_evidence = Some last_frame.
+(** A trace-order witness distinguishes events with equal clock ticks.
+    It comes from the script and platform for these observations and
+    this dispatch, with the time comparison below providing a separate
+    check on the reported clock. The readiness edge witnesses awaiting
+    this observation. It does not force the observation to stay open. *)
+Section OverlappingObservation.
+  Context {Sample Evidence Image Event : Type}.
+  Variable window : ObservationWindow Sample.
+  Variable profile : ImageLayout.Profile Evidence Image.
+  Variable budget : nat.
+  Variable accepts : list Evidence -> Prop.
+  Variable presents : Evidence -> option (Timed Sample).
+  Variable ready_precedes_request : Prop.
+  Variables captured_before_event : Timed Sample -> Timed Event -> Prop.
+  Variables event_before_capture : Timed Event -> Timed Sample -> Prop.
+  Variable start slack finished : Tick.
+  Variable plan : Intent Event.
+  Variable sent : list (Timed Event).
 
-Theorem overlapping_report_has_visible_samples_before_and_after
-    {Sample Evidence Image Event} (window : ObservationWindow Sample)
-    (profile : ImageLayout.Profile Evidence Image) budget presents layout
-    start slack finished (plan : Intent Event) sent :
-  spans_dispatch window profile budget presents layout start slack finished plan sent ->
-  exists first last last_event before_evidence after_evidence,
-    In first (captured window) /\ In last (captured window) /\
-    current_view sent last_event /\
-    In before_evidence (ImageLayout.layout_evidence layout) /\ presents before_evidence = Some first /\
-    In after_evidence (ImageLayout.layout_evidence layout) /\ presents after_evidence = Some last /\
-    (forall event, In event sent -> at_tick first <= at_tick event) /\
-    at_tick last_event <= at_tick last.
-Proof.
-  intros [(head & tail & frames & _ & bounds & _) [ready [[[_ scheduled] _] [_
-    (first & rest & last_event & prefix & last & eb & ea & trace & sent_end &
-     after & Eb & Cb & Ea & Ca)]]]].
-  assert (head = first) as -> by congruence.
-  exists first, last, last_event, eb, ea. rewrite trace. repeat split; try assumption.
-  - now left.
-  - right. apply in_or_app. now right; left.
-  - now exists prefix.
-  - intros e member.
-    assert (lower : forall (plans events : list (Timed Event)),
-      Forall2 (scheduled_pair start slack) plans events ->
-      forall event, In event events -> start <= at_tick event).
-    { intros plans events matches. induction matches as [|planned event ps es Hp matched IH].
-      - simpl. tauto.
-      - intros x [<-|in_rest]; [|now apply IH].
-        unfold scheduled_pair, due in Hp. lia. }
-    specialize (lower _ _ scheduled _ member). lia.
-Qed.
+  (** Any genuine delivered capture on each side suffices. Readiness
+      can be established by an earlier frame whose state is preserved
+      by a later representative. The later representative must itself
+      still precede the action to count as before evidence. *)
+  Definition visible_boundaries first_event last_event (evidence : list Evidence) : Prop :=
+    exists first last before_evidence after_evidence,
+      exists prefix between suffix,
+      captured window = prefix ++ first :: between ++ last :: suffix /\
+      first <> last /\
+      captured_before_event first first_event /\ event_before_capture last_event last /\
+      at_tick first <= at_tick first_event /\ at_tick last_event <= at_tick last /\
+      In before_evidence evidence /\ presents before_evidence = Some first /\
+      In after_evidence evidence /\ presents after_evidence = Some last.
+
+  Definition spans_dispatch (layout : list (ImageLayout.Attachment Evidence Image)) : Prop :=
+    valid_window window /\ ready_at window <= start /\ ready_precedes_request /\
+    completed_dispatch start slack finished plan (issued sent) /\
+    exists first_event rest last_event,
+      sent = first_event :: rest /\ current_view sent last_event /\
+      ImageLayout.delivered profile budget
+        (fun evidence => accepts evidence /\ visible_boundaries first_event last_event evidence) layout.
+
+  Theorem overlapping_report_has_visible_samples_before_and_after layout :
+    spans_dispatch layout ->
+    exists first last first_event last_event before_evidence after_evidence,
+      exists prefix between suffix,
+      captured window = prefix ++ first :: between ++ last :: suffix /\
+      first <> last /\
+      captured_before_event first first_event /\ event_before_capture last_event last /\
+      In before_evidence (ImageLayout.layout_evidence layout) /\ presents before_evidence = Some first /\
+      In after_evidence (ImageLayout.layout_evidence layout) /\ presents after_evidence = Some last /\
+      (forall event, In event sent -> at_tick first <= at_tick event <= at_tick last).
+  Proof.
+    intros [_ [_ [_ [[[chronological_dispatch _] _]
+      (first_event & rest & last_event & begins & ends &
+       [[_ [[_ (first & last & eb & ea & prefix & between & suffix & observed & distinct & before & after &
+           before_time & after_time & Eb & Cb & Ea & Ca)] _]] _])]]]].
+    exists first, last, first_event, last_event, eb, ea, prefix, between, suffix.
+    split; [exact observed |]. split; [exact distinct |].
+    split; [exact before |]. split; [exact after |].
+    split; [exact Eb |]. split; [exact Cb |]. split; [exact Ea |]. split; [exact Ca |].
+    intros event member. split.
+    - transitivity (at_tick first_event); [exact before_time|].
+      rewrite begins in member. destruct member as [<-|member]; [lia|].
+      apply in_split in member. destruct member as (pre & post & split).
+      apply (chronological_dispatch [] first_event pre event post). now rewrite begins, split.
+    - transitivity (at_tick last_event); [|exact after_time].
+      destruct ends as [pre ends]. rewrite ends in member.
+      apply in_app_or in member. destruct member as [member | [<- | []]]; [|lia].
+      apply in_split in member. destruct member as (a & b & split).
+      apply (chronological_dispatch a event b last_event []). rewrite ends, split.
+      now rewrite <- app_assoc.
+  Qed.
+End OverlappingObservation.
 
 Theorem capture_requested_after_completion_follows_dispatch {Image Event}
     start slack finished (plan : Intent Event) sent (window : ObservationWindow Image) :
@@ -810,36 +1098,51 @@ Qed.
     actually rendered, not all samples represented by a time interval.
     A scroll mosaic contributes content, not a complete historical
     viewport. Such a viewport must be selected as a full frame. *)
-Definition full_history_spans_dispatch {Target Raster LocalPoint DesktopPoint Image Event}
-    (window : ObservationWindow (@Capture Target Raster LocalPoint DesktopPoint))
-    (profile : ImageLayout.Profile (@FullInterval Target Raster LocalPoint DesktopPoint) Image)
-    {Answer} (decide : _ -> Answer) target budget final layout
-    start slack finished (plan : Intent Event) sent : Prop :=
-  complete_screen_report profile decide target
-    (requested_at _ window) (delivered_at window) budget (captured window) final layout /\
-  spans_dispatch window profile budget (fun evidence => Some (representative evidence))
-    layout start slack finished plan sent.
+(** Equal content on both sides of an action is still two pieces of
+    temporal evidence when a caller needs to inspect that boundary.
+    The task labels captures by their causal phase; unknown order cannot
+    be used as evidence on either side. *)
+Definition complete_evidence_across_boundary {Target Raster DesktopPoint Answer Phase}
+    (decide : @Capture Target Raster DesktopPoint -> Answer)
+    (phase_of : @Frame Target Raster DesktopPoint -> Phase) frames final evidence : Prop :=
+  full_history
+    (fun a b => decision_equivalent decide (value a) (value b) /\ phase_of a = phase_of b)
+    frames evidence /\ current_view frames final /\
+    exists earlier last, evidence = earlier ++ [last] /\ representative last = final.
 
-Definition animation_spans_dispatch {Target Raster LocalPoint DesktopPoint Image Event}
-    (window : ObservationWindow (@Capture Target Raster LocalPoint DesktopPoint))
-    (profile : ImageLayout.Profile (@Frame Target Raster LocalPoint DesktopPoint) Image)
-    important target budget final layout start slack finished (plan : Intent Event) sent : Prop :=
-  animation_report profile important target
-    (requested_at _ window) (delivered_at window) budget (captured window) final layout /\
-  spans_dispatch window profile budget (@Some _) layout start slack finished plan sent.
+Definition full_history_spans_dispatch {Target Raster DesktopPoint Image Event}
+    (window : ObservationWindow (@Capture Target Raster DesktopPoint))
+    (profile : ImageLayout.Profile (@FullInterval Target Raster DesktopPoint) Image)
+    (coordinates : @FullFrameCoordinates DesktopPoint)
+    {Answer Phase} (decide : _ -> Answer) (phase_of : _ -> Phase)
+    target budget final ready_order before_event after_event layout
+    start slack finished (plan : Intent Event) sent : Prop :=
+  captured_for target (requested_at _ window) (delivered_at window) (captured window) /\
+  layout_covers_decision profile decide /\
+  spans_dispatch window profile budget (complete_evidence_across_boundary decide phase_of (captured window) final)
+    (fun evidence => Some (representative evidence)) ready_order before_event after_event start slack finished plan sent layout /\
+  full_coordinates_faithful coordinates layout.
+
+Definition animation_spans_dispatch {Target Raster DesktopPoint Image Event}
+    (window : ObservationWindow (@Capture Target Raster DesktopPoint))
+    (profile : ImageLayout.Profile (@Frame Target Raster DesktopPoint) Image)
+    important target budget final ready_order before_event after_event layout start slack finished (plan : Intent Event) sent : Prop :=
+  captured_for target (requested_at _ window) (delivered_at window) (captured window) /\
+  spans_dispatch window profile budget (animation_evidence important (captured window) final)
+    (@Some _) ready_order before_event after_event start slack finished plan sent layout.
 
 Definition mixed_spans_dispatch {Sample Target LocalPoint ContentPoint Pixel Image Event}
     (window : ObservationWindow Sample) (target_of : Sample -> Target)
     (read_pixel : Timed Sample -> LocalPoint -> option Pixel)
     (content_point : Timed Sample -> LocalPoint -> option ContentPoint)
-    (profile : ImageLayout.Profile (@Tile Sample ContentPoint Pixel) Image)
-    required_full target budget scroll_samples mosaic final layout
+    (profile : ImageLayout.Profile (@Tile Sample LocalPoint ContentPoint Pixel) Image)
+    required_full target budget scroll_samples mosaic final ready_order before_event after_event layout
     start slack finished (plan : Intent Event) sent : Prop :=
-  mixed_report target_of read_pixel content_point profile required_full target
-    (requested_at _ window) (delivered_at window) budget (captured window) scroll_samples mosaic final layout /\
+  capture_batch target_of target (requested_at _ window) (delivered_at window) (captured window) /\
   spans_dispatch window profile budget
+    (mixed_evidence read_pixel content_point required_full (captured window) scroll_samples mosaic final)
     (fun evidence => match evidence with Full frame => Some frame | Mosaic _ => None end)
-    layout start slack finished plan sent.
+    ready_order before_event after_event start slack finished plan sent layout.
 
 Section Continuation.
   Context {Target Reference Invocation Button Key Position : Type}.
@@ -1008,15 +1311,15 @@ Section Continuation.
   (** Movement needs no extra button press or release. The held
       button is established before the motion sequence and released
       by the ordinary operation finish when requested. *)
-  Definition drag_motion before button position_at duration (samples : Intent Position)
+  Definition drag_motion before button position_at duration gap (samples : Intent Position)
       (receipt : ControlDispatch) : Prop :=
     held before (inl button) /\ receipt_valid before receipt /\
-    follows_trajectory position_at duration samples /\
+    follows_trajectory position_at duration gap samples /\
     dispatch_plan receipt = map (fun s => {| at_tick := at_tick s; value := Move (value s) |}) samples /\
     exists sent, dispatch_outcome receipt = issued sent.
 
-  Theorem drag_motion_does_not_release_the_button before button position_at duration samples receipt :
-    drag_motion before button position_at duration samples receipt ->
+  Theorem drag_motion_does_not_release_the_button before button position_at duration gap samples receipt :
+    drag_motion before button position_at duration gap samples receipt ->
     known_held (acknowledged receipt) (held before) (inl button).
   Proof.
     intros [held_now [[_ [_ [_ [valid _]]]] [_ [plan [sent issued_ok]]]]].
@@ -1050,52 +1353,64 @@ Section Background.
     delivered_human_text : list (Focus * Text)
   }.
 
-  Context {PhysicalInput Environment TargetState : Type}.
+  Context {PhysicalInput Environment TargetState ToolAction : Type}.
   Record BackgroundRun := {
     physical_input : PhysicalInput;
     environment : Environment;
+    tool_actions : list ToolAction;
     human_observation : Tick -> HumanObservation;
-    target_before : TargetState;
-    target_after : TargetState
+    target_at : Tick -> TargetState
   }.
 
-  Definition comparable (baseline action : BackgroundRun) : Prop :=
+  Definition comparable (baseline action : BackgroundRun) (start : Tick) : Prop :=
+    tool_actions baseline = [] /\ tool_actions action <> [] /\
     physical_input action = physical_input baseline /\
     environment action = environment baseline /\
-    target_before action = target_before baseline.
+    target_at action start = target_at baseline start.
 
-  Definition background_success baseline action
+  Definition background_success baseline action start finish
       (expected_effect : TargetState -> TargetState -> Prop) : Prop :=
-    comparable baseline action /\ expected_effect (target_before action) (target_after action) /\
-    forall t, human_observation action t = human_observation baseline t.
+    start <= finish /\ comparable baseline action start /\
+    expected_effect (target_at action start) (target_at action finish) /\
+    ~ expected_effect (target_at baseline start) (target_at baseline finish) /\
+    forall t, start <= t <= finish -> human_observation action t = human_observation baseline t.
 
-  Theorem foreground_switch_refutes_background baseline action expected t :
+  Theorem spontaneous_effect_refutes_background baseline action start finish expected :
+    expected (target_at baseline start) (target_at baseline finish) ->
+    ~ background_success baseline action start finish expected.
+  Proof. intros spontaneous [_ [_ [_ [absent _]]]]. exact (absent spontaneous). Qed.
+
+  Theorem an_automated_baseline_cannot_establish_background_success baseline action start finish expected :
+    tool_actions baseline <> [] -> ~ background_success baseline action start finish expected.
+  Proof. intros automation [_ [[no_automation _] _]]. contradiction. Qed.
+
+  Theorem foreground_switch_refutes_background baseline action start finish expected t :
     foreground_app (human_observation action t) <>
       foreground_app (human_observation baseline t) ->
-    ~ background_success baseline action expected.
-  Proof. intros different [_ [_ H]]. apply different. now rewrite (H t). Qed.
+    start <= t <= finish -> ~ background_success baseline action start finish expected.
+  Proof. intros different within [_ [_ [_ [_ H]]]]. apply different. now rewrite (H t within). Qed.
 
-  Theorem moved_pointer_refutes_background baseline action expected t :
+  Theorem moved_pointer_refutes_background baseline action start finish expected t :
     hardware_pointer (human_observation action t) <>
       hardware_pointer (human_observation baseline t) ->
-    ~ background_success baseline action expected.
-  Proof. intros different [_ [_ H]]. apply different. now rewrite (H t). Qed.
+    start <= t <= finish -> ~ background_success baseline action start finish expected.
+  Proof. intros different within [_ [_ [_ [_ H]]]]. apply different. now rewrite (H t within). Qed.
 
-  Theorem diverted_keys_refute_background baseline action expected t :
+  Theorem diverted_keys_refute_background baseline action start finish expected t :
     delivered_human_keys (human_observation action t) <>
       delivered_human_keys (human_observation baseline t) ->
-    ~ background_success baseline action expected.
-  Proof. intros different [_ [_ H]]. apply different. now rewrite (H t). Qed.
-  Theorem intra_application_focus_change_refutes_background baseline action expected t :
+    start <= t <= finish -> ~ background_success baseline action start finish expected.
+  Proof. intros different within [_ [_ [_ [_ H]]]]. apply different. now rewrite (H t within). Qed.
+  Theorem intra_application_focus_change_refutes_background baseline action start finish expected t :
     focus_target (human_observation action t) <> focus_target (human_observation baseline t) ->
-    ~ background_success baseline action expected.
-  Proof. intros different [_ [_ H]]. apply different. now rewrite (H t). Qed.
+    start <= t <= finish -> ~ background_success baseline action start finish expected.
+  Proof. intros different within [_ [_ [_ [_ H]]]]. apply different. now rewrite (H t within). Qed.
 
-  Theorem changed_human_text_refutes_background baseline action expected t :
+  Theorem changed_human_text_refutes_background baseline action start finish expected t :
     delivered_human_text (human_observation action t) <>
       delivered_human_text (human_observation baseline t) ->
-    ~ background_success baseline action expected.
-  Proof. intros different [_ [_ H]]. apply different. now rewrite (H t). Qed.
+    start <= t <= finish -> ~ background_success baseline action start finish expected.
+  Proof. intros different within [_ [_ [_ [_ H]]]]. apply different. now rewrite (H t within). Qed.
 End Background.
 
 (** Accessibility observations and actions are different effects. A UI

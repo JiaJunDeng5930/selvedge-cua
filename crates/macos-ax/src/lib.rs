@@ -18,7 +18,7 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
 use objc2_core_foundation::{CFBoolean, CFNumber, CFString, CFType};
 use selvedge_rules::accessibility;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use native::{Attributes, Element};
@@ -77,13 +77,25 @@ pub fn perform_ui_action(options: &Value) -> Result<Value, String> {
     })
 }
 
-/// Verify the requested target is an editable text control and owns the
-/// target application’s keyboard focus, then call the platform sender with the PID and
-/// text while the retained native identity is still on the AX worker.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextDelivery {
+    AccessibilitySelection,
+    FocusedProcess,
+    NoOp,
+}
+
+/// Verify that the requested editable control owns the application's keyboard
+/// focus. Send the text to that element if it exposes a writable selection.
+/// Standard AppKit fields can expose a writable value and no selection setter.
+/// For those controls, the sender posts text to the checked process.
+/// KNOWN LIMITATION: Focus is sampled in a separate native call. An
+/// element-directed write retains its destination if focus changes, while a
+/// process-directed event is routed by the application's focus on delivery.
 pub fn insert_text(
     options: &Value,
     send: impl FnOnce(i32, &str) -> Result<(), String> + Send + 'static,
-) -> Result<i32, String> {
+) -> Result<(i32, TextDelivery), String> {
     let options: TextOptions = decode(options, "insertText")?;
     let target = Target::parse(&options.target)?;
     submit(move |accessibility| {
@@ -95,8 +107,11 @@ pub fn insert_text(
             role.as_deref(),
             Some("AXTextField" | "AXTextArea" | "AXComboBox")
         );
-        let writable = native::settable(element, "AXValue").map_err(|error| error.to_string())?
-            || native::settable(element, "AXSelectedText").map_err(|error| error.to_string())?;
+        let selection_writable =
+            native::settable(element, native::SELECTED_TEXT).map_err(|error| error.to_string())?;
+        let writable = selection_writable
+            || native::settable(element, "AXValue").map_err(|error| error.to_string())?;
+        let selected_text = selection_writable.then(|| CFString::from_str(&options.text));
         let enabled = native::enabled(element).map_err(|error| error.to_string())?;
         let application = native::application(pid);
         let focused = native::element_attribute(&application, "AXFocusedUIElement")
@@ -107,10 +122,16 @@ pub fn insert_text(
             enabled == Some(false),
             focused.as_deref() == Some(&**element),
         )?;
-        // KNOWN LIMITATION: macOS exposes focus reads and event posting as
-        // separate operations. The application can change focus after this read.
-        send(pid, &options.text)?;
-        Ok(pid)
+        let delivery = if options.text.is_empty() {
+            TextDelivery::NoOp
+        } else if let Some(text) = selected_text {
+            native::replace_selected_text(element, &text).map_err(|error| error.to_string())?;
+            TextDelivery::AccessibilitySelection
+        } else {
+            send(pid, &options.text)?;
+            TextDelivery::FocusedProcess
+        };
+        Ok((pid, delivery))
     })
 }
 

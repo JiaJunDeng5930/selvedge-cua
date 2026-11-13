@@ -1,17 +1,9 @@
 use crate::{
     convert::{boolean, items, list, n, number},
-    corelib::init::datatypes::{Bool, Prod},
-    observation_rules::{self, Delivery, ImageKind},
+    corelib::init::datatypes::{Bool, Nat, Option_1, Prod},
+    observation_rules::{self, Candidate},
 };
 use std::ops::RangeInclusive;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    Keyframe,
-    Change,
-    Scroll,
-    Viewport,
-}
 
 pub fn group_frames(same_as_previous: &[bool]) -> Vec<RangeInclusive<usize>> {
     items(observation_rules::group_frames(list(
@@ -36,26 +28,25 @@ pub fn same_scroll(first: [u32; 6], next: [u32; 6]) -> bool {
     )
 }
 
-pub enum ImagePlan {
-    Combined(Vec<usize>),
-    Separate(Vec<Vec<usize>>),
-}
-
-pub fn delivery_plan(budget: usize, history: &[Kind]) -> ImagePlan {
-    let kinds = list(history.iter().copied().enumerate().map(|(index, kind)| {
-        Prod::Pair(
-            n(index as u64),
-            match kind {
-                Kind::Keyframe => ImageKind::Keyframe,
-                Kind::Change => ImageKind::Change,
-                Kind::Scroll => ImageKind::Scroll,
-                Kind::Viewport => ImageKind::Viewport,
-            },
-        )
+/// Select readable attachments that cover all evidence in order within the
+/// attachment budget. Each row lists the (span, token cost) choices starting
+/// at that evidence position.
+pub fn pack_images(budget: usize, candidates: &[Vec<(usize, u64)>]) -> Option<Vec<usize>> {
+    let rows = list(candidates.iter().enumerate().map(|(index, choices)| {
+        let remaining = candidates.len() - index;
+        list(choices.iter().filter_map(move |&(span, cost)| {
+            // DEFENSE: A public caller can submit an empty span or one
+            // extending beyond the evidence. Neither describes an attachment.
+            if span == 0 || span > remaining {
+                return None;
+            }
+            let following = (1..span).fold(Nat::O, |count, _| Nat::S(Box::new(count)));
+            Some(Candidate::Candidate(following, n(cost)))
+        }))
     }));
-    let indices = |group| items(group).map(|id| number(&id) as usize).collect();
-    match observation_rules::delivery_plan(n(budget as u64), kinds) {
-        Delivery::Combined(history) => ImagePlan::Combined(indices(history)),
-        Delivery::Separate(history) => ImagePlan::Separate(items(history).map(indices).collect()),
+    let budget = budget.min(candidates.len());
+    match observation_rules::pack_images(n(budget as u64), rows) {
+        Option_1::Some(spans) => Some(items(spans).map(|span| number(&span) as usize).collect()),
+        Option_1::None => None,
     }
 }

@@ -48,8 +48,8 @@ Proof.
   unfold group_frames. apply group_after_last.
 Qed.
 
-(* Area is measured in pixels. A spatially small change needs the before
-   and after crop. Changes spread across the viewport use a keyframe. *)
+(* The capture adapter uses this threshold to protect local changes from
+   scroll merging. Area is measured in pixels. *)
 Definition local_change (changed_area viewport_area : N) : bool :=
   (3 * changed_area <? viewport_area).
 
@@ -78,120 +78,289 @@ Proof.
   - intro H. inversion H. auto.
 Qed.
 
-Inductive image_kind := Keyframe | Change | Scroll | Viewport.
+(* Each row describes the readable attachments starting at one evidence
+   position. A candidate covers that position and [following] more.
+   Its cost includes metadata attributable to the attachment. *)
+Record candidate := Candidate { following : nat; estimated_tokens : N }.
 
-Definition priority (kind : image_kind) : N :=
-  match kind with Keyframe => 0 | Change => 1 | Scroll => 2 | Viewport => 3 end.
+Record packing := Packing {
+  tokens : N;
+  attachment_count : N;
+  spans : list N
+}.
 
-Definition pick (best candidate : N * image_kind) : N * image_kind :=
-  if priority (snd best) <=? priority (snd candidate) then candidate else best.
+Definition empty_packing := Packing 0 0 [].
 
-(* Candidates in each chronological bucket compete for that bucket's slot. *)
-Definition select_bucket (bucket : list (N * image_kind)) : option N :=
-  match bucket with
+Definition prepend (first : candidate) (suffix : packing) :=
+  Packing (estimated_tokens first + tokens suffix)
+          (N.succ (attachment_count suffix))
+          (N.pos (Pos.of_succ_nat (following first)) :: spans suffix).
+
+Definition no_more_expensive a b :=
+  tokens a < tokens b \/ (tokens a = tokens b /\ attachment_count a <= attachment_count b).
+
+Definition cheaper_or_equal a b :=
+  if tokens a =? tokens b
+  then attachment_count a <=? attachment_count b
+  else tokens a <? tokens b.
+
+Definition prefer (a b : option packing) :=
+  match a, b with
+  | Some first, Some second => if cheaper_or_equal first second then a else b
+  | Some _, None => a
+  | None, _ => b
+  end.
+
+Definition extend (first : candidate) (suffixes : list (option packing)) :=
+  match nth_error suffixes (following first) with
+  | Some (Some suffix) => Some (prepend first suffix)
+  | _ => None
+  end.
+
+Fixpoint choose (row : list candidate) (suffixes : list (option packing)) :=
+  match row with
   | [] => None
-  | first :: rest => Some (fst (fold_left pick rest first))
+  | first :: rest => prefer (extend first suffixes) (choose rest suffixes)
   end.
 
-Lemma pick_from_either a b : pick a b = a \/ pick a b = b.
-Proof. unfold pick. destruct (_ <=? _); auto. Qed.
-
-Lemma fold_pick_member rest first :
-  In (fold_left pick rest first) (first :: rest).
-Proof.
-  revert first.
-  induction rest as [| next rest IH]; intro first; simpl; [auto |].
-  specialize (IH (pick first next)).
-  destruct (pick_from_either first next) as [H | H]; rewrite H in *.
-  - destruct IH as [Hfirst | Hrest]; [now left | now right; right].
-  - destruct IH as [Hnext | Hrest]; [now right; left | now right; right].
-Qed.
-
-Theorem select_bucket_member bucket id :
-  select_bucket bucket = Some id -> exists kind, In (id, kind) bucket.
-Proof.
-  destruct bucket as [| first rest]; [discriminate |].
-  simpl. destruct (fold_left pick rest first) as [chosen kind] eqn:Hchoice.
-  intros H; inversion H; subst. exists kind.
-  pose proof (fold_pick_member rest first) as Hmember.
-  rewrite Hchoice in Hmember. exact Hmember.
-Qed.
-
-(* A separate viewport uses one slot. A one-image observation uses a
-   montage with the viewport as an additional tile in that same slot. *)
-Definition history_slots (budget : N) : N :=
-  if 1 <? budget then budget - 1 else budget.
-
-Theorem history_slots_reserve_viewport budget :
-  1 < budget -> history_slots budget + 1 = budget.
-Proof.
-  intros H. unfold history_slots.
-  assert ((1 <? budget) = true) as -> by now apply N.ltb_lt.
-  lia.
-Qed.
-
-(* First spread the history selection over time, then pack at most three
-   selected assets into an image. The final viewport has its own place in
-   every valid delivery plan. Its pixels come from the last frame group. *)
-Fixpoint buckets {A : Type} (fuel : nat) (total slots previous : N) (items : list A)
-  : list (list A) :=
-  match fuel, items with
-  | O, _ | _, [] => []
-  | S remaining, _ =>
-    let next := previous + 1 in
-    let size := N.to_nat (next * total / slots - previous * total / slots) in
-    firstn size items :: buckets remaining total slots next (skipn size items)
+(* The previous table supplies the best packing of every suffix with
+   one fewer available attachment. The final cell covers empty evidence. *)
+Fixpoint advance (rows : list (list candidate)) (previous : list (option packing)) :=
+  match rows, previous with
+  | row :: rest, _ :: suffixes => choose row suffixes :: advance rest suffixes
+  | _, _ => [Some empty_packing]
   end.
 
-Definition split_evenly {A : Type} (slots : N) (items : list A) :=
-  buckets (N.to_nat slots) (N.of_nat (length items)) slots 0 items.
+Fixpoint packings (budget : nat) (rows : list (list candidate)) :=
+  match budget with
+  | O => map (fun _ => None) rows ++ [Some empty_packing]
+  | S remaining => advance rows (packings remaining rows)
+  end.
 
-Definition history_choices (slots : N) (kinds : list (N * image_kind)) : list N :=
-  let limit := 3 * slots in
-  if N.of_nat (length kinds) <=? limit then map fst kinds
-  else flat_map (fun bucket =>
-    match select_bucket bucket with Some id => [id] | None => [] end)
-    (split_evenly limit kinds).
+Definition pack_images (budget : N) (rows : list (list candidate)) : option (list N) :=
+  match hd None (packings (N.to_nat budget) rows) with
+  | Some plan => Some (spans plan)
+  | None => None
+  end.
 
-Inductive delivery := Combined (history : list N) | Separate (history : list (list N)).
+(* Feasibility follows the ordered evidence independently of the
+   algorithm's tables. A candidate may consume only existing positions. *)
+Inductive feasible : nat -> list (list candidate) -> packing -> Prop :=
+  | finish budget : feasible budget [] empty_packing
+  | attach budget row rest first suffix :
+      In first row ->
+      (following first <= length rest)%nat ->
+      feasible budget (skipn (following first) rest) suffix ->
+      feasible (S budget) (row :: rest) (prepend first suffix).
 
-Definition delivery_plan (budget : N) (kinds : list (N * image_kind)) : delivery :=
-  let slots := history_slots budget in
-  let chosen := history_choices slots kinds in
-  if 1 <? budget
-  then Separate (split_evenly (N.min slots (N.of_nat (length chosen))) chosen)
-  else Combined chosen.
+Definition best (valid : packing -> Prop) (choice : option packing) : Prop :=
+  match choice with
+  | Some selected => valid selected /\ forall other, valid other -> no_more_expensive selected other
+  | None => forall other, ~ valid other
+  end.
 
-Lemma buckets_bound {A} fuel total slots previous (items : list A) :
-  (length (buckets fuel total slots previous items) <= fuel)%nat.
+Lemma comparison_contract a b :
+  if cheaper_or_equal a b then no_more_expensive a b else no_more_expensive b a.
 Proof.
-  revert previous items.
-  induction fuel as [| fuel IH]; intros previous [| head rest]; simpl; try lia.
-  apply le_n_S. apply IH.
+  unfold cheaper_or_equal, no_more_expensive.
+  destruct (N.eqb_spec (tokens a) (tokens b)) as [equal | different].
+  - destruct (N.leb_spec0 (attachment_count a) (attachment_count b)); right; lia.
+  - destruct (N.ltb_spec0 (tokens a) (tokens b)); left; lia.
 Qed.
 
-Theorem delivery_plan_budget budget kinds groups :
-  delivery_plan budget kinds = Separate groups ->
-  (N.of_nat (length groups) + 1 <= budget)%N.
+Lemma cost_order_transitive a b c :
+  no_more_expensive a b -> no_more_expensive b c -> no_more_expensive a c.
+Proof. unfold no_more_expensive. lia. Qed.
+
+Lemma prepend_preserves_cost_order first a b :
+  no_more_expensive a b -> no_more_expensive (prepend first a) (prepend first b).
+Proof. unfold no_more_expensive, prepend. simpl. lia. Qed.
+
+Lemma best_equivalent (valid other : packing -> Prop) choice :
+  (forall plan, valid plan <-> other plan) ->
+  best valid choice -> best other choice.
+Proof. destruct choice; simpl; firstorder. Qed.
+
+Lemma prefer_best (valid_a valid_b : packing -> Prop) a b :
+  best valid_a a ->
+  best valid_b b ->
+  best (fun plan => valid_a plan \/ valid_b plan) (prefer a b).
 Proof.
-  unfold delivery_plan.
-  destruct (1 <? budget) eqn:Hbudget; [| discriminate].
-  intro H. inversion H; subst groups; clear H.
-  apply N.ltb_lt in Hbudget.
-  pose proof (history_slots_reserve_viewport budget Hbudget) as Hslots.
-  unfold split_evenly.
-  set (chosen := history_choices (history_slots budget) kinds) in *.
-  set (slots := N.min (history_slots budget) (N.of_nat (length chosen))) in *.
-  pose proof (buckets_bound (N.to_nat slots) (N.of_nat (length chosen)) slots 0 chosen) as Hcount.
-  assert (N.of_nat (length (buckets (N.to_nat slots) (N.of_nat (length chosen)) slots 0 chosen))
-          <= slots) as Hbound.
-  { apply Nat.compare_le_iff in Hcount.
-    rewrite Nat2N.inj_compare, N2Nat.id in Hcount.
-    exact Hcount. }
-  assert (slots <= history_slots budget) by (unfold slots; apply N.le_min_l).
-  lia.
+  destruct a as [a|], b as [b|]; simpl.
+  - pose proof (comparison_contract a b) as order.
+    intros [valid_left lower_left] [valid_right lower_right].
+    destruct (cheaper_or_equal a b); simpl.
+    + split; [now left |].
+      intros other [valid | valid]; [now apply lower_left |].
+      eapply cost_order_transitive; [exact order | now apply lower_right].
+    + split; [now right |].
+      intros other [valid | valid]; [| now apply lower_right].
+      eapply cost_order_transitive; [exact order | now apply lower_left].
+  - firstorder.
+  - firstorder.
+  - firstorder.
 Qed.
 
-Theorem one_image_includes_viewport kinds :
-  exists history, delivery_plan 1 kinds = Combined history.
-Proof. eexists. reflexivity. Qed.
+Fixpoint valid_table budget rows table : Prop :=
+  match rows, table with
+  | [], [choice] => best (feasible budget []) choice
+  | _ :: rest, choice :: suffixes =>
+      best (feasible budget rows) choice /\ valid_table budget rest suffixes
+  | _, _ => False
+  end.
+
+Lemma table_length budget rows table :
+  valid_table budget rows table -> length table = S (length rows).
+Proof.
+  revert table.
+  induction rows as [|row rest IH]; intros [|choice suffixes]; simpl; try contradiction.
+  - destruct suffixes; simpl; intuition.
+  - intros [_ tail]. now rewrite (IH _ tail).
+Qed.
+
+Lemma table_lookup budget rows table offset choice :
+  valid_table budget rows table ->
+  nth_error table offset = Some choice ->
+  best (feasible budget (skipn offset rows)) choice.
+Proof.
+  revert rows table.
+  induction offset as [|offset IH]; intros [|row rest] [|current suffixes] table_ok at_offset;
+    simpl in *; try contradiction.
+  - destruct suffixes; try contradiction.
+    injection at_offset as <-. exact table_ok.
+  - injection at_offset as <-. tauto.
+  - destruct suffixes; try contradiction. destruct offset; discriminate.
+  - exact (IH rest suffixes (proj2 table_ok) at_offset).
+Qed.
+
+Definition fits budget rows first plan :=
+  (following first <= length rows)%nat /\
+  exists suffix, feasible budget (skipn (following first) rows) suffix /\ plan = prepend first suffix.
+
+Lemma extend_best budget rows table first :
+  valid_table budget rows table ->
+  best (fits budget rows first) (extend first table).
+Proof.
+  intro table_ok.
+  unfold extend.
+  destruct (nth_error table (following first)) as [choice|] eqn:at_offset.
+  - assert (within : (following first <= length rows)%nat).
+    { pose proof (table_length _ _ _ table_ok) as count.
+      assert (nth_error table (following first) <> None) as present by congruence.
+      apply nth_error_Some in present.
+      lia. }
+    pose proof (table_lookup _ _ _ _ _ table_ok at_offset) as suffix_best.
+    destruct choice as [suffix|]; simpl in *.
+    + destruct suffix_best as [valid lower]. split.
+      * split; eauto.
+      * intros other [_ [alternative [valid_alternative ->]]].
+        apply prepend_preserves_cost_order. now apply lower.
+    + intros other [_ [alternative [valid _]]].
+      now apply (suffix_best alternative).
+  - intros other [within _].
+    apply nth_error_None in at_offset.
+    pose proof (table_length _ _ _ table_ok). lia.
+Qed.
+
+Lemma choose_best budget rows table row :
+  valid_table budget rows table ->
+  best (fun plan => exists first, In first row /\ fits budget rows first plan) (choose row table).
+Proof.
+  intro table_ok.
+  induction row as [|first rest IH]; simpl choose.
+  - simpl. firstorder.
+  - apply (best_equivalent (fun plan =>
+      fits budget rows first plan \/ (exists choice, In choice rest /\ fits budget rows choice plan))).
+    + intros plan. simpl In. split.
+      * intros [fits_first | [choice [available fits_choice]]].
+        -- exists first. auto.
+        -- exists choice. auto.
+      * intros [choice [[equal | available] fits_choice]].
+        -- subst choice. now left.
+        -- right. eauto.
+    + apply prefer_best; [now apply extend_best | exact IH].
+Qed.
+
+Lemma empty_packing_best budget :
+  best (feasible budget []) (Some empty_packing).
+Proof.
+  split; [constructor |].
+  intros other valid. inversion valid; subst.
+  unfold no_more_expensive. right. split; [reflexivity | apply N.le_refl].
+Qed.
+
+Lemma advance_valid budget rows previous :
+  valid_table budget rows previous -> valid_table (S budget) rows (advance rows previous).
+Proof.
+  revert previous.
+  induction rows as [|row rest IH]; intros [|choice suffixes]; simpl; try contradiction.
+  - intros _. apply empty_packing_best.
+  - intros [_ suffixes_ok]. split.
+    + apply (best_equivalent (fun plan => exists first, In first row /\ fits budget rest first plan)).
+      * intros plan. split.
+        -- intros [first [available [within [suffix [valid ->]]]]]. now constructor.
+        -- intro valid.
+           inversion valid as [|budget' row' rest' first suffix available within tail_valid]; subst.
+           exists first. split; [exact available |].
+           split; [exact within |]. exists suffix. auto.
+      * now apply choose_best.
+    + now apply IH.
+Qed.
+
+Lemma zero_budget rows :
+  valid_table O rows (packings O rows).
+Proof.
+  induction rows as [|row rest IH]; simpl.
+  - apply empty_packing_best.
+  - split; [intros other valid; inversion valid | exact IH].
+Qed.
+
+Lemma packing_table_valid budget rows :
+  valid_table budget rows (packings budget rows).
+Proof.
+  induction budget; [apply zero_budget | simpl; now apply advance_valid].
+Qed.
+
+Lemma feasible_coverage budget rows plan :
+  feasible budget rows plan ->
+  Forall (fun span => 0 < span) (spans plan) /\
+  fold_right N.add 0 (spans plan) = N.of_nat (length rows) /\
+  length (spans plan) = N.to_nat (attachment_count plan) /\
+  (length (spans plan) <= budget)%nat.
+Proof.
+  intro valid.
+  induction valid as [budget|budget row rest first suffix available within valid IH].
+  - simpl. repeat split; try constructor; lia.
+  - destruct IH as [positive [coverage [count bounded]]].
+    cbn [prepend spans attachment_count length fold_right].
+    change (N.pos (Pos.of_succ_nat (following first))) with (N.of_nat (S (following first))).
+    rewrite coverage, length_skipn, <- Nat2N.inj_add, N2Nat.inj_succ.
+    replace (S (following first) + (length rest - following first))%nat with (S (length rest)) by lia.
+    repeat split; try lia.
+    constructor; [rewrite Nat2N.inj_succ; lia | exact positive].
+Qed.
+
+Theorem pack_images_contract budget rows :
+  match pack_images budget rows with
+  | Some selected =>
+      exists plan, spans plan = selected /\
+        feasible (N.to_nat budget) rows plan /\
+        (forall other, feasible (N.to_nat budget) rows other -> no_more_expensive plan other) /\
+        Forall (fun span => 0 < span) selected /\
+        fold_right N.add 0 selected = N.of_nat (length rows) /\
+        (length selected <= N.to_nat budget)%nat
+  | None => forall other, ~ feasible (N.to_nat budget) rows other
+  end.
+Proof.
+  unfold pack_images.
+  pose proof (packing_table_valid (N.to_nat budget) rows) as table_ok.
+  destruct (packings (N.to_nat budget) rows) as [|choice suffixes] eqn:table.
+  - pose proof (table_length _ _ _ table_ok). discriminate.
+  - pose proof (table_lookup _ _ _ O choice table_ok eq_refl) as selected_best.
+    simpl in selected_best |- *.
+    destruct choice as [selected|]; simpl in selected_best.
+    + destruct selected_best as [valid lower].
+      destruct (feasible_coverage _ _ _ valid) as [positive [coverage [count bounded]]].
+      eauto 10.
+    + exact selected_best.
+Qed.

@@ -26,6 +26,7 @@ pub struct Input {
 struct DispatchState {
     rules: State,
     running: bool,
+    dispatch_epoch: u64,
     used_in_run: bool,
     drag_position: Option<Point>,
     target: Option<Target>,
@@ -143,6 +144,11 @@ struct ScrollEvent {
 impl Input {
     pub fn snapshot(&self) -> Value {
         self.state().snapshot()
+    }
+
+    pub fn observation_epoch(&self) -> Option<u64> {
+        let epoch = self.state().dispatch_epoch;
+        epoch.is_multiple_of(2).then_some(epoch)
     }
 
     pub async fn pointer(
@@ -411,24 +417,27 @@ impl Input {
         }
         let (releases, cleanup) = state.release(continuation.hold, failure.is_some(), clock);
         state.running = false;
-        match (failure, cleanup) {
-            (None, Ok(())) => {
-                let mut result = state.snapshot();
-                result["startedAtMs"] =
-                    json!(started_at.duration_since(clock).as_secs_f64() * 1000.0);
-                result["events"] = json!(events);
-                result["releases"] = json!(releases);
-                result["finishedAtMs"] = json!(clock.elapsed().as_secs_f64() * 1000.0);
-                Ok(result)
-            }
-            (Some(error), Ok(())) | (None, Err(error)) => Err(error),
-            (Some(error), Err(cleanup)) => Err(format!("{error}; release failed: {cleanup}")),
-        }
+        let mut result = state.snapshot();
+        result["startedAtMs"] = json!(started_at.duration_since(clock).as_secs_f64() * 1000.0);
+        result["events"] = json!(events);
+        result["releases"] = json!(releases);
+        result["finishedAtMs"] = json!(clock.elapsed().as_secs_f64() * 1000.0);
+        let failure = match (failure, cleanup) {
+            (None, Ok(())) => return Ok(result),
+            (Some(error), Ok(())) | (None, Err(error)) => error,
+            (Some(error), Err(cleanup)) => format!("{error}; release failed: {cleanup}"),
+        };
+        Err(format!("{failure}; partial dispatch receipt: {result}"))
     }
 
     pub async fn exclusive<T>(&self, operation: impl Future<Output = T>) -> T {
         let _dispatch = self.dispatch.lock().await;
-        operation.await
+        // AX effects can become visible while the native call is still
+        // pending. Odd epochs mark this open dispatch interval.
+        self.state().dispatch_epoch += 1;
+        let result = operation.await;
+        self.state().dispatch_epoch += 1;
+        result
     }
 
     pub async fn finish_run(&self, successful: bool, clock: Instant) -> Result<(), String> {
@@ -530,7 +539,8 @@ impl DispatchState {
             }
         };
         let releasing = matches!(event, Event::Release(_));
-        self.rules.dispatch(event.change(), || {
+        let mut posted = false;
+        let result = self.rules.dispatch(event.change(), || {
             if !target.process.is_live() {
                 // A dead process has no remaining background input state. A
                 // release must never target a new process reusing its PID.
@@ -549,7 +559,7 @@ impl DispatchState {
                     .expect("a pointing event has a window")
                     .revalidate()?;
             }
-            match event {
+            let result = match event {
                 Event::Move(point) => {
                     let window = window();
                     if buttons.is_empty() {
@@ -600,8 +610,12 @@ impl DispatchState {
                 Event::Scroll { at, dx, dy } => {
                     native::scroll_in_window(window(), at, dx, dy, &modifiers)
                 }
-            }
-        })
+            };
+            posted = result.is_ok();
+            result
+        });
+        self.dispatch_epoch += 2 * u64::from(posted);
+        result
     }
 }
 

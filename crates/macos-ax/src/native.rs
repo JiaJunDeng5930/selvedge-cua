@@ -11,6 +11,7 @@ use objc2_core_foundation::{
 use serde_json::{Value, json};
 
 pub type Element = CFRetained<AXUIElement>;
+pub const SELECTED_TEXT: &str = "AXSelectedText";
 
 #[derive(Debug)]
 pub enum Error {
@@ -219,6 +220,12 @@ pub fn set_value(element: &AXUIElement, value: &CFType) -> Result<(), Error> {
     // SAFETY: The argument is a live CF scalar. AX validates the value's class
     // against the requirements of the element's AXValue attribute.
     check(unsafe { element.set_attribute_value(&CFString::from_str("AXValue"), value) })
+}
+
+pub fn replace_selected_text(element: &AXUIElement, text: &CFString) -> Result<(), Error> {
+    // SAFETY: The element and text remain live for this call. The application
+    // handles the selection replacement through the specified element.
+    check(unsafe { element.set_attribute_value(&CFString::from_str(SELECTED_TEXT), text.as_ref()) })
 }
 
 type Field = (&'static str, &'static str, fn(&CFType) -> Option<Value>);

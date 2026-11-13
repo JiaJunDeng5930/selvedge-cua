@@ -33,7 +33,11 @@ already knows the target application's PID as `targetPid`.
 ```js
 const ui = await readUI({ pid: targetPid });
 const windowId = ui.window.windowId;
-const observation = observeScreen({ target: { windowId }, durationMs: 700 });
+const observation = observeScreen({
+  target: { windowId },
+  durationMs: 700,
+  preserveInputBoundaries: true,
+});
 await observation.started;
 const point = ui.focused.position;
 await pointer({
@@ -47,7 +51,7 @@ return await observation.finished;
 
 | Function | Options and behavior |
 | --- | --- |
-| `observeScreen` | `{durationMs?, intervalMs?, imageBudget?, target?}`. A zero duration gives one frame. The default target is the main display. Set `target` to `{displayId}`, `{windowId}`, or `{region: {x, y, width, height}}`. Await `.started` for the first frame's time. Await the observation directly or via `.finished` for the image manifest. |
+| `observeScreen` | `{durationMs?, intervalMs?, imageBudget?, preserveInputBoundaries?, target?}`. A zero duration gives one frame. The default target is the main display. Set `target` to `{displayId}`, `{windowId}`, or `{region: {x, y, width, height}}`. Await `.started` for the first frame's time. Await the observation directly or via `.finished` for the image manifest. Set `preserveInputBoundaries: true` to keep identical samples taken after different completed input dispatches. |
 | `readUI` | `{pid?, maxDepth?, maxNodes?}`. The default PID is the foreground app. Returns its focused element, window tree, input snapshot and observation time. A matching on-screen window also exposes `windowId`. |
 | `pointer` | `{windowId?, position, durationMs?, intervalMs?, buttons?, hold?, operation?}`. A new trajectory requires a window ID. The function receives the elapsed milliseconds and returns `{x, y}`. The default duration is zero and the default sample interval is 16 ms. Buttons 0, 1 and 2 correspond to left, right and middle. |
 | `keyboard` | `{pid?, events, hold?, operation?}`. Supply the PID for a new keyboard operation. Each event is `{atMs?, key, down}`. Physical key names use `KeyboardEvent.code` names such as `KeyA`, `ShiftLeft` and `ArrowDown`. |
@@ -67,7 +71,9 @@ A successful input call reports the dispatch times and held controls. Set
 reference in a later input call to continue the same action, including across
 MCP calls. `pointer({operation})` releases the controls without moving.
 A cancelled plan stops between dispatches and releases the controls still
-recorded as held. An application may react after the dispatch completes.
+recorded as held. A plan interrupted after dispatch begins includes a partial
+receipt in the rejection message. An application may react after the dispatch
+completes.
 
 The MCP result has `structuredContent.result` and
 `structuredContent.observations`. The latter contains each successful
@@ -75,12 +81,25 @@ observation and its `imageOffset` and `imageCount` among PNG attachments.
 Add `imageOffset` to a tile's `imageIndex` to locate the attachment. The tile's
 `imageRect` is the pixel rectangle in that PNG, and its `desktopRect` describes
 the source in desktop points. Use the manifest's `viewport` for the last real
-capture. Other tiles can show a keyframe, a before/after crop or a scroll mosaic.
+capture. Each tile carries its representative capture time and the bounds of
+the sample interval it represents. These times record macOS capture delivery.
+
+Consecutive equivalent captures share one interval. If the sampled sequence is
+A, A, A, B, A, the three intervals show whole frames A, B, A. Aligned scrolling
+content can appear as a mosaic with per-strip source coordinates. Sustained
+animation may omit intermediate frames to stay within the image budget.
+Whole frames and scroll parts can share an attachment when its layout
+preserves their modeled detail. Packing minimizes estimated image tokens
+among the available row and column layouts. Actual token accounting depends
+on the MCP client and model. The observation rejects if required evidence
+cannot fit within the image budget at that detail.
 
 ## Source and validation
 
-The rules used by the running program and their contracts are in
-[`crates/rules/formal`](crates/rules/formal). The Cargo build checks the Rocq
+[`Requirement.v`](crates/rules/formal/Requirement.v) derives the desktop
+contracts from engineering needs. The executable rules, including
+[`ObservationRules.v`](crates/rules/formal/ObservationRules.v), are in the same
+directory. The Cargo build checks the Rocq
 objects, audits theorem assumptions, and extracts the functions used by the
 Rust adapters. The system clock, image measurements, JavaScript engine,
 and macOS responses are external inputs to those rules.
@@ -102,5 +121,9 @@ the scripted input. Run it while the pointer is stationary for that comparison.
 Mouse and scroll dispatch require macOS window-local event routing. AppKit
 applications can receive it in the background. The routing capability is
 checked before dispatch, and application support for routed events varies.
-Keyboard and text events are directed to the target process. Accessibility
-actions act on the retained element directly.
+Keyboard events are directed to the target process. Accessibility actions
+act on the retained element directly. Text insertion checks the requested
+field's focus, then writes its accessible selection where supported.
+Other fields receive process-directed text after a focus check. Focus can
+change between that check and delivery. The receipt reports
+`accessibilitySelection`, `focusedProcess`, or `noOp`.
