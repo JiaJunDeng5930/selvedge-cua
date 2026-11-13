@@ -1,0 +1,31 @@
+Require Import InputRules.
+
+Print Assumptions press_accepted.
+Print Assumptions release_accepted.
+Print Assumptions apply_preserves_unique.
+Print Assumptions validation_contract.
+Print Assumptions validation_preserves_unique.
+Print Assumptions empty_session_allocates.
+Print Assumptions only_live_owner_can_continue.
+Print Assumptions closed_reference_is_stale.
+Print Assumptions finish_releases_all.
+Print Assumptions explicit_hold_preserves.
+Print Assumptions failure_releases_all.
+Print Assumptions new_pointer_presses_contract.
+
+Require Import Schedule ObservationRules AccessibilityRules.
+Print Assumptions sample_times_contract.
+Print Assumptions sample_times_single.
+Print Assumptions group_frames_preserves_latest.
+Print Assumptions local_change_contract.
+Print Assumptions same_scroll_contract.
+Print Assumptions select_bucket_member.
+Print Assumptions history_slots_reserve_viewport.
+Print Assumptions reference_live_contract.
+Print Assumptions authorize_insertion_contract.
+
+Print Assumptions delivery_plan_budget.
+Print Assumptions one_image_includes_viewport.
+
+Print Assumptions first_destination.
+Print Assumptions continuation_preserves_destination.

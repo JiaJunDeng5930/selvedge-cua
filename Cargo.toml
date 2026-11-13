@@ -1,0 +1,23 @@
+[package]
+name = "selvedge-cua-mcp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+selvedge-rules = { path = "crates/rules" }
+selvedge-macos-ax = { path = "crates/macos-ax" }
+selvedge-macos-input = { path = "crates/macos-input" }
+selvedge-macos-screen = { path = "crates/macos-screen" }
+selvedge-script-server = { path = "crates/script-server" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
+
+[profile.dev]
+debug = 0
+
+[workspace]
+members = ["crates/*"]
+resolver = "3"

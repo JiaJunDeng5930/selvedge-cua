@@ -1,0 +1,16 @@
+[package]
+name = "selvedge-macos-ax"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+selvedge-rules = { path = "../rules" }
+libc = "0.2"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSRunningApplication", "libc"] }
+objc2-application-services = { version = "0.3.2", default-features = false, features = ["std", "AXError", "AXUIElement", "AXValue", "HIServices", "libc"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFCGTypes", "CFDictionary", "CFNumber", "CFString"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGGeometry", "CGWindow", "CGWindowLevel"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
