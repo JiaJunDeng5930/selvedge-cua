@@ -24,6 +24,12 @@ permissions. JavaScript, Rocq, and extraction are built into the executable
 or used during the build. There are no language runtimes to install alongside
 the binary.
 
+If a build at the configured path repeatedly times out in ScreenCaptureKit
+while an identical copy works on the same unlocked desktop, copy the verified
+build to a new file beside the configured executable and rename it into place.
+Reconnect the MCP client so it launches the replacement. An existing MCP
+process continues using its original executable after the file is replaced.
+
 ## Write a script
 
 A script can return any JSON-serializable value. Native calls return promises
@@ -52,12 +58,19 @@ return await observation.finished;
 | Function | Options and behavior |
 | --- | --- |
 | `observeScreen` | `{durationMs?, intervalMs?, imageBudget?, preserveInputBoundaries?, target?}`. A zero duration gives one frame. The default target is the main display. Set `target` to `{displayId}`, `{windowId}`, or `{region: {x, y, width, height}}`. Await `.started` for the first frame's time. Await the observation directly or via `.finished` for the image manifest. Set `preserveInputBoundaries: true` to keep identical samples taken after different completed input dispatches. |
-| `readUI` | `{pid?, maxDepth?, maxNodes?}`. The default PID is the foreground app. Returns its focused element, window tree, input snapshot and observation time. A matching on-screen window also exposes `windowId`. |
+| `readUI` | `{pid?, maxDepth?, maxNodes?, fields?}`. The default PID is the foreground app. Returns its focused element, window tree, input snapshot and observation time. A matching on-screen window also exposes `windowId`. |
 | `pointer` | `{windowId?, position, durationMs?, intervalMs?, buttons?, hold?, operation?}`. A new trajectory requires a window ID. The function receives the elapsed milliseconds and returns `{x, y}`. The default duration is zero and the default sample interval is 16 ms. Buttons 0, 1 and 2 correspond to left, right and middle. |
 | `keyboard` | `{pid?, events, hold?, operation?}`. Supply the PID for a new keyboard operation. Each event is `{atMs?, key, down}`. Physical key names use `KeyboardEvent.code` names such as `KeyA`, `ShiftLeft` and `ArrowDown`. |
 | `scroll` | `{windowId?, x, y, events, operation?}`. Supply a window ID or a window-bound operation. Each event is `{atMs?, dx?, dy?}` in pixels. Positive deltas scroll right and down. Passing an operation preserves its held controls. |
 | `insertText` | `{target, text}`. Pass the `target` returned by `readUI` for the focused editable text field in the target application. |
 | `performUIAction` | `{target, action, value?}`. Use an action exposed by `readUI`. `AXSetValue` accepts a JSON string, number or boolean on writable controls. |
+
+Omit `readUI.fields` for all node attributes. Pass a list containing any of
+`role`, `subrole`, `title`, `description`, `value`, `position`, `size`,
+`enabled`, `identifier`, `help`, `placeholder`, `actions`, and `settable`
+to limit the attributes read and returned. Each node still provides its
+`role` and `target`, the window tree retains its children, and the root
+still includes a matching `windowId`.
 
 Times with the `AtMs` suffix are measured in milliseconds since the server
 started. Event offsets are relative to the start of their input plan. Pointer
@@ -86,8 +99,10 @@ the sample interval it represents. These times record macOS capture delivery.
 
 Consecutive equivalent captures share one interval. If the sampled sequence is
 A, A, A, B, A, the three intervals show whole frames A, B, A. Aligned scrolling
-content can appear as a mosaic with per-strip source coordinates. Sustained
-animation may omit intermediate frames to stay within the image budget.
+content can appear as a mosaic with per-strip source coordinates. In a
+sequence of shifts in the same direction, varying detected bounds can share
+one mosaic when the sampled pixels confirm a translation over common bounds.
+Sustained animation may omit intermediate frames to stay within the image budget.
 Whole frames and scroll parts can share an attachment when its layout
 preserves their modeled detail. Packing minimizes estimated image tokens
 among the available row and column layouts. Actual token accounting depends

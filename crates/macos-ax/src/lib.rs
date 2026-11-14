@@ -40,7 +40,8 @@ pub fn frontmost_pid() -> Result<i32, String> {
 pub fn read_ui(options: &Value) -> Result<Value, String> {
     let options: ReadOptions = decode(options, "readUI")?;
     let limits = ReadLimits::from_options(&options)?;
-    submit(move |accessibility| accessibility.read(options.pid, limits))
+    let fields = ReadFields::new(options.fields)?;
+    submit(move |accessibility| accessibility.read(options.pid, limits, fields))
 }
 
 /// Apply a native action or set a writable AXValue attribute. The target
@@ -145,6 +146,7 @@ struct ReadOptions {
     pid: Option<i32>,
     max_depth: Option<usize>,
     max_nodes: Option<usize>,
+    fields: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -163,6 +165,28 @@ struct TextOptions {
 struct ReadLimits {
     depth: usize,
     nodes: usize,
+}
+
+struct ReadFields(Option<Vec<String>>);
+
+impl ReadFields {
+    fn new(fields: Option<Vec<String>>) -> Result<Self, String> {
+        if let Some(fields) = &fields {
+            for field in fields {
+                if !matches!(field.as_str(), "actions" | "settable") && !native::is_attribute(field)
+                {
+                    return Err(format!("Unknown readUI field: {field}"));
+                }
+            }
+        }
+        Ok(Self(fields))
+    }
+
+    fn includes(&self, field: &str) -> bool {
+        self.0
+            .as_ref()
+            .is_none_or(|fields| fields.iter().any(|selected| selected == field))
+    }
 }
 
 impl ReadLimits {
@@ -283,7 +307,7 @@ impl Accessibility {
         Self {
             next_target: 0,
             reads: VecDeque::new(),
-            attributes: Attributes::new(),
+            attributes: Attributes::new(|_| true),
             timeout_configured: false,
         }
     }
@@ -312,7 +336,12 @@ impl Accessibility {
         Ok(target)
     }
 
-    fn read(&mut self, pid: Option<i32>, limits: ReadLimits) -> Result<Value, String> {
+    fn read(
+        &mut self,
+        pid: Option<i32>,
+        limits: ReadLimits,
+        fields: ReadFields,
+    ) -> Result<Value, String> {
         let application = match pid {
             Some(pid) => NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
                 .filter(|application| pid > 0 && !application.isTerminated())
@@ -324,10 +353,21 @@ impl Accessibility {
         let window = current_window(&ax).map_err(|error| error.to_string())?;
         let focused = native::element_attribute(&ax, "AXFocusedUIElement")
             .map_err(|error| error.to_string())?;
+        let attributes = fields
+            .0
+            .as_ref()
+            .map(|_| Attributes::new(|name| name == "role" || fields.includes(name)));
+        let window_attributes = fields.0.as_ref().map(|_| {
+            Attributes::new(|name| {
+                matches!(name, "role" | "position" | "size" | "title") || fields.includes(name)
+            })
+        });
         let mut read = WindowRead {
             application,
             next_target: &mut self.next_target,
-            attributes: &self.attributes,
+            attributes: attributes.as_ref().unwrap_or(&self.attributes),
+            window_attributes: window_attributes.as_ref().unwrap_or(&self.attributes),
+            fields,
             targets: HashMap::new(),
             remaining: limits.nodes,
             max_depth: limits.depth,
@@ -339,14 +379,19 @@ impl Accessibility {
             .map_err(|error| error.to_string())?
             .flatten();
         let focused = focused
-            .map(|focused| read.describe(focused))
+            .map(|focused| read.describe(focused, false))
             .transpose()
             .map_err(|error| error.to_string())?
             .flatten();
-        if let Some(Value::Object(window)) = &mut window
-            && let Some(window_id) = window_id::find(pid, window)
-        {
-            window.insert("windowId".into(), json!(window_id));
+        if let Some(Value::Object(window)) = &mut window {
+            if let Some(window_id) = window_id::find(pid, window) {
+                window.insert("windowId".into(), json!(window_id));
+            }
+            for field in ["position", "size", "title"] {
+                if !read.fields.includes(field) {
+                    window.remove(field);
+                }
+            }
         }
         let result = json!({
             "pid": pid,
@@ -386,6 +431,8 @@ struct WindowRead<'a> {
     application: Retained<NSRunningApplication>,
     next_target: &'a mut u64,
     attributes: &'a Attributes,
+    window_attributes: &'a Attributes,
+    fields: ReadFields,
     targets: HashMap<Target, RetainedTarget>,
     remaining: usize,
     max_depth: usize,
@@ -396,8 +443,9 @@ impl WindowRead<'_> {
     fn describe(
         &mut self,
         element: Element,
+        window_root: bool,
     ) -> Result<Option<serde_json::Map<String, Value>>, native::Error> {
-        match self.describe_live(element) {
+        match self.describe_live(element, window_root) {
             // DEFENSE: Applications can delete an element after its parent
             // was observed. Mark the result incomplete when that occurs.
             Err(error) if error.is_invalid_element() => {
@@ -411,12 +459,28 @@ impl WindowRead<'_> {
     fn describe_live(
         &mut self,
         element: Element,
+        window_root: bool,
     ) -> Result<serde_json::Map<String, Value>, native::Error> {
-        let mut node = self.attributes.read(&element)?;
-        let mut actions = native::actions(&element)?;
-        let settable = native::settable(&element, "AXValue")?;
-        if settable {
-            actions.push("AXSetValue".into());
+        let attributes = if window_root {
+            self.window_attributes
+        } else {
+            self.attributes
+        };
+        let mut node = attributes.read(&element)?;
+        let include_actions = self.fields.includes("actions");
+        let include_settable = self.fields.includes("settable");
+        if include_actions || include_settable {
+            let settable = native::settable(&element, "AXValue")?;
+            if include_actions {
+                let mut actions = native::actions(&element)?;
+                if settable {
+                    actions.push("AXSetValue".into());
+                }
+                node.insert("actions".into(), json!(actions));
+            }
+            if include_settable {
+                node.insert("settable".into(), json!(settable));
+            }
         }
         let target = Target(*self.next_target);
         *self.next_target += 1;
@@ -428,13 +492,11 @@ impl WindowRead<'_> {
             },
         );
         node.insert("target".into(), json!(target.name()));
-        node.insert("actions".into(), json!(actions));
-        node.insert("settable".into(), json!(settable));
         Ok(node)
     }
 
     fn tree(&mut self, element: Element, depth: usize) -> Result<Option<Value>, native::Error> {
-        let Some(mut node) = self.describe(element.clone())? else {
+        let Some(mut node) = self.describe(element.clone(), depth == 0)? else {
             return Ok(None);
         };
         self.remaining -= 1;

@@ -52,27 +52,38 @@ impl Axis {
 }
 
 impl Shift {
-    pub fn residual(self, before: &RgbaImage, after: &RgbaImage) -> Option<PixelRect> {
-        let first = self.axis.longitudinal(self.area.x, self.area.y);
-        let end = first + self.axis.longitudinal(self.area.width, self.area.height);
-        let side = self.axis.lateral(self.area.x, self.area.y);
-        let side_end = side + self.axis.lateral(self.area.width, self.area.height);
-        super::observation::difference_bounds(after, |x, y| {
-            let along = self.axis.longitudinal(x, y);
-            let across = self.axis.lateral(x, y);
-            if (first..end).contains(&along) && (side..side_end).contains(&across) {
-                let source = along as i32 + self.delta;
-                if (first as i32..end as i32).contains(&source) {
-                    let (x, y) = self.axis.xy(source as u32, across);
-                    Some(before.get_pixel(x, y))
-                } else {
-                    // This strip has just entered the viewport and belongs in the mosaic.
-                    None
-                }
-            } else {
-                Some(before.get_pixel(x, y))
+    /// Check the stationary pixels and the translated overlap. The incoming
+    /// strip has no preceding pixels to compare and is retained in the mosaic.
+    pub fn has_residual(self, before: &RgbaImage, after: &RgbaImage) -> bool {
+        let axis = self.axis;
+        let start = axis.longitudinal(self.area.x, self.area.y) as usize;
+        let end = start + axis.longitudinal(self.area.width, self.area.height) as usize;
+        let displacement = self.delta.unsigned_abs() as usize;
+        let (source, target) = if self.delta > 0 {
+            (start + displacement..end, start..end - displacement)
+        } else {
+            (start..end - displacement, start + displacement..end)
+        };
+        let row_bytes = after.width() as usize * 4;
+        let before = before.as_raw();
+        let after = after.as_raw();
+        match axis {
+            Axis::Vertical => {
+                before[..start * row_bytes] != after[..start * row_bytes]
+                    || before[end * row_bytes..] != after[end * row_bytes..]
+                    || before[source.start * row_bytes..source.end * row_bytes]
+                        != after[target.start * row_bytes..target.end * row_bytes]
             }
-        })
+            Axis::Horizontal => before
+                .chunks_exact(row_bytes)
+                .zip(after.chunks_exact(row_bytes))
+                .any(|(before, after)| {
+                    before[..start * 4] != after[..start * 4]
+                        || before[end * 4..] != after[end * 4..]
+                        || before[source.start * 4..source.end * 4]
+                            != after[target.start * 4..target.end * 4]
+                }),
+        }
     }
 }
 

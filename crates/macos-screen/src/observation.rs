@@ -153,11 +153,16 @@ impl<'a> Asset<'a> {
 }
 
 fn collect_evidence(runs: &[FrameRun]) -> Vec<Asset<'_>> {
+    let shifts: Vec<_> = runs
+        .windows(2)
+        .map(|pair| scroll_between(&pair[0], &pair[1]))
+        .collect();
+    let shifts = stabilize_scroll_areas(runs, &shifts);
     let mut evidence = Vec::new();
     let mut current = 0;
     while current + 1 < runs.len() {
-        if let Some(shift) = scroll_between(&runs[current], &runs[current + 1]) {
-            current = scroll_run(runs, current + 1, shift, &mut evidence) - 1;
+        if let Some(shift) = shifts[current] {
+            current = scroll_run(runs, &shifts, current + 1, shift, &mut evidence) - 1;
         } else {
             if !evidence.last().is_some_and(|asset: &Asset<'_>| {
                 asset.kind == Kind::Keyframe
@@ -221,25 +226,27 @@ fn difference(previous: &FrameRun, current: &FrameRun) -> Option<PixelRect> {
     if !before.same_viewport(after) {
         return None;
     }
-    difference_bounds(&after.pixels, |x, y| Some(before.pixels.get_pixel(x, y)))
-}
-
-pub(super) fn difference_bounds<'a>(
-    image: &RgbaImage,
-    mut reference: impl FnMut(u32, u32) -> Option<&'a Rgba<u8>>,
-) -> Option<PixelRect> {
-    let mut left = image.width();
-    let mut top = image.height();
+    let width = after.pixels.width();
+    let height = after.pixels.height();
+    let row_bytes = width as usize * 4;
+    let mut left = width;
+    let mut top = height;
     let mut right = 0;
     let mut bottom = 0;
-    for (x, y, pixel) in image.enumerate_pixels() {
-        if let Some(other) = reference(x, y)
-            && pixel != other
-        {
-            left = left.min(x);
+    for y in 0..height {
+        let offset = y as usize * row_bytes;
+        let before = &before.pixels.as_raw()[offset..offset + row_bytes];
+        let after = &after.pixels.as_raw()[offset..offset + row_bytes];
+        let pixels = before.chunks_exact(4).zip(after.chunks_exact(4));
+        if let Some(first) = pixels.clone().position(|(a, b)| a != b) {
+            let last = pixels
+                .rev()
+                .position(|(a, b)| a != b)
+                .expect("a pixel differs");
+            left = left.min(first as u32);
+            right = right.max(width - last as u32);
             top = top.min(y);
-            right = right.max(x + 1);
-            bottom = bottom.max(y + 1);
+            bottom = y + 1;
         }
     }
     (left < right).then(|| PixelRect {
@@ -254,6 +261,12 @@ fn is_local(run: &FrameRun, changed: PixelRect) -> bool {
     rules::local_change(changed.area(), run.latest.frame.full_area().area())
 }
 
+#[derive(Clone, Copy)]
+struct ScrollStep {
+    shift: Shift,
+    has_residual: bool,
+}
+
 fn scroll_between(previous: &FrameRun, current: &FrameRun) -> Option<Shift> {
     let changed = difference(previous, current)?;
     if is_local(current, changed) {
@@ -266,12 +279,59 @@ fn scroll_between(previous: &FrameRun, current: &FrameRun) -> Option<Shift> {
     )
 }
 
+fn stabilize_scroll_areas(runs: &[FrameRun], shifts: &[Option<Shift>]) -> Vec<Option<ScrollStep>> {
+    let mut steps = Vec::with_capacity(shifts.len());
+    let mut start = 0;
+    while start < shifts.len() {
+        let Some(first) = shifts[start] else {
+            steps.push(None);
+            start += 1;
+            continue;
+        };
+        let mut end = start + 1;
+        let mut area = first.area;
+        while let Some(Some(next)) = shifts.get(end) {
+            if next.axis != first.axis || next.delta.signum() != first.delta.signum() {
+                break;
+            }
+            area = area.union(next.area);
+            end += 1;
+        }
+
+        // Equal edge pixels make a difference rectangle narrower than the
+        // scrolling region. Use the common bounds only if the captured pixels
+        // confirm that the same translation explains each frame pair there.
+        for (index, shift) in shifts.iter().enumerate().take(end).skip(start) {
+            let shift = shift.expect("the run consists of detected scrolls");
+            let before = &runs[index].latest.frame.pixels;
+            let after = &runs[index + 1].latest.frame.pixels;
+            let expanded = Shift { area, ..shift };
+            let step = if !expanded.has_residual(before, after) {
+                ScrollStep {
+                    shift: expanded,
+                    has_residual: false,
+                }
+            } else {
+                ScrollStep {
+                    shift,
+                    has_residual: area == shift.area || shift.has_residual(before, after),
+                }
+            };
+            steps.push(Some(step));
+        }
+        start = end;
+    }
+    steps
+}
+
 fn scroll_run<'a>(
     runs: &'a [FrameRun],
+    shifts: &[Option<ScrollStep>],
     start: usize,
-    first_shift: Shift,
+    first_step: ScrollStep,
     history: &mut Vec<Asset<'a>>,
 ) -> usize {
+    let first_shift = first_step.shift;
     let axis = first_shift.axis;
     let area = first_shift.area;
     let mut slices = vec![Slice {
@@ -280,8 +340,9 @@ fn scroll_run<'a>(
     }];
     let mut changes = Vec::new();
     let mut index = start;
-    let mut shift = first_shift;
+    let mut step = first_step;
     loop {
+        let shift = step.shift;
         let previous = &runs[index - 1];
         let current = &runs[index];
         let length = shift.delta.unsigned_abs();
@@ -301,28 +362,22 @@ fn scroll_run<'a>(
                 axis.lateral(area.width, area.height),
             ),
         });
-        if (shift
-            .residual(&previous.latest.frame.pixels, &current.latest.frame.pixels)
-            .is_some()
-            || !same_input_phase(&previous.latest, &current.latest))
+        if (step.has_residual || !same_input_phase(&previous.latest, &current.latest))
             && index + 1 < runs.len()
         {
             changes.push(Asset::single(Kind::Keyframe, current));
         }
 
         index += 1;
-        let Some(next) = runs
-            .get(index)
-            .and_then(|next| scroll_between(current, next))
-        else {
+        let Some(next) = shifts.get(index - 1).copied().flatten() else {
             break;
         };
-        if !rules::same_scroll(shift_signature(shift), shift_signature(next)) {
+        if !rules::same_scroll(shift_signature(shift), shift_signature(next.shift)) {
             break;
         }
-        shift = next;
+        step = next;
     }
-    if shift.delta < 0 {
+    if first_shift.delta < 0 {
         slices.reverse();
     }
     // A long scroll remains readable as consecutive, abutting parts.
@@ -577,4 +632,81 @@ fn encode_image(
         )
         .map_err(|error| error.to_string())?;
     Ok((bytes, items))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn scrolling_past_blank_rows_keeps_one_mosaic_and_the_final_viewport() {
+        let viewport = DesktopRect {
+            x: 0.0,
+            y: 0.0,
+            width: 160.0,
+            height: 96.0,
+        };
+        for offsets in [[0, 10, 20, 30], [30, 20, 10, 0]] {
+            let frames = offsets.into_iter().enumerate().map(|(index, offset)| {
+                let pixels = RgbaImage::from_fn(160, 96, |x, y| {
+                    let row = y + offset;
+                    if row % 13 < 5 {
+                        Rgba([240, 240, 240, 255])
+                    } else {
+                        Rgba([row as u8, x as u8, 40, 255])
+                    }
+                });
+                TimedFrame {
+                    frame: Frame::new(pixels, viewport, Instant::now()).unwrap(),
+                    at_ms: index as f64 * 100.0,
+                    input_epoch: Some(0),
+                }
+            });
+            let result = summarize(frames.collect(), 6).unwrap();
+            let items: Vec<_> = result.metadata["images"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|attachment| attachment.as_array().unwrap())
+                .collect();
+            assert_eq!(items.len(), 2, "{items:?}");
+            assert_eq!(items[0]["kind"], "scroll");
+            assert_eq!(items[1]["kind"], "viewport");
+            let strips = items[0]["tiles"].as_array().unwrap();
+            assert_eq!(strips.len(), offsets.len());
+            let first_row = strips[0]["desktopRect"]["y"].as_f64().unwrap() as u32;
+            let last_row = strips.last().unwrap()["desktopRect"]["y"].as_f64().unwrap() as u32
+                + strips.last().unwrap()["imageRect"]["height"]
+                    .as_u64()
+                    .unwrap() as u32;
+            assert!(first_row <= 5 && last_row >= 91, "{strips:?}");
+            let decoded = image::load_from_memory(
+                &result.images[strips[0]["imageIndex"].as_u64().unwrap() as usize],
+            )
+            .unwrap()
+            .into_rgba8();
+            let packed_x = strips[0]["imageRect"]["x"].as_u64().unwrap() as u32;
+            let packed_y = strips[0]["imageRect"]["y"].as_u64().unwrap() as u32;
+            let height: u32 = strips
+                .iter()
+                .map(|tile| tile["imageRect"]["height"].as_u64().unwrap() as u32)
+                .sum();
+            assert!(height >= 116);
+            for y in 0..height {
+                let row = y + first_row;
+                let expected = if row % 13 < 5 {
+                    Rgba([240, 240, 240, 255])
+                } else {
+                    Rgba([row as u8, 79, 40, 255])
+                };
+                assert_eq!(
+                    *decoded.get_pixel(packed_x + 79, packed_y + y),
+                    expected,
+                    "row {row}"
+                );
+            }
+            assert_eq!(result.metadata["viewport"]["atMs"], 300.0);
+        }
+    }
 }

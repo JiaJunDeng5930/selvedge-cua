@@ -116,4 +116,17 @@ impl PixelRect {
     fn area(self) -> u64 {
         u64::from(self.width) * u64::from(self.height)
     }
+
+    fn union(self, other: Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = (self.x + self.width).max(other.x + other.width);
+        let bottom = (self.y + self.height).max(other.y + other.height);
+        Self {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        }
+    }
 }

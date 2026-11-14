@@ -102,6 +102,8 @@ def protocol(client):
     result, _ = client.run("throw new Error('intentional failure')", expect_error=True)
     assert "intentional failure" in result["error"], result
     assert client.run("return 42;")[0]["result"] == 42
+    result, _ = client.run('return await readUI({fields:["typo"]});', expect_error=True)
+    assert "Unknown readUI field: typo" in result["error"], result
 
 
 def result(client, code):
@@ -233,6 +235,21 @@ def desktop(client, fixture, fixture_binary, log_path):
         assert time.monotonic() < end, "AppKit fixture did not expose its background window"
         time.sleep(.1)
     assert ui["window"]["windowId"] == window_id, window_id
+    compact = result(client, f"""
+        const ui = await readUI({{pid:{pid}, fields:["title"]}});
+        const all = node => [node, ...node.children.flatMap(all)];
+        const nodes = all(ui.window);
+        const button = nodes.find(node => node.title === "Fixture button");
+        return {{
+            windowId: ui.window.windowId,
+            button: Boolean(button?.target),
+            fields: [...new Set([...nodes, ui.focused].flatMap(Object.keys))].sort(),
+        }};
+    """)
+    assert compact == {
+        "windowId": window_id, "button": True,
+        "fields": ["children", "role", "target", "title", "windowId"],
+    }, compact
     print("desktop display and window capture passed", flush=True)
     local_screen_change(client, fixture_binary, pid, ready["pulseRegion"], events)
     assert desktop_state() == before, "Background observation changed foreground or hardware cursor"

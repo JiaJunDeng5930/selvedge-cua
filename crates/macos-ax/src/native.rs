@@ -248,14 +248,27 @@ const ATTRIBUTES: [Field; 11] = [
 
 pub struct Attributes {
     names: CFRetained<CFArray<CFString>>,
+    fields: Vec<Field>,
+}
+
+pub fn is_attribute(field: &str) -> bool {
+    ATTRIBUTES.iter().any(|&(_, name, _)| name == field)
 }
 
 impl Attributes {
-    pub fn new() -> Self {
-        let names = ATTRIBUTES.map(|(name, _, _)| CFString::from_str(name));
-        let refs = names.each_ref().map(|name| &**name);
+    pub fn new(includes: impl Fn(&str) -> bool) -> Self {
+        let fields: Vec<_> = ATTRIBUTES
+            .into_iter()
+            .filter(|&(_, name, _)| includes(name))
+            .collect();
+        let names: Vec<_> = fields
+            .iter()
+            .map(|&(name, _, _)| CFString::from_str(name))
+            .collect();
+        let refs: Vec<_> = names.iter().map(|name| &**name).collect();
         Self {
             names: CFArray::from_objects(&refs),
+            fields,
         }
     }
 
@@ -271,13 +284,13 @@ impl Attributes {
         };
         check(error)?;
         let values = array(copied(values, "AXUIElementCopyMultipleAttributeValues")?);
-        if values.len() != ATTRIBUTES.len() {
+        if values.len() != self.fields.len() {
             return Err(Error::UnexpectedResponse(
                 "AXUIElementCopyMultipleAttributeValues",
             ));
         }
         let mut fields = serde_json::Map::new();
-        for ((_, name, decode), value) in ATTRIBUTES.into_iter().zip(values.iter()) {
+        for (&(_, name, decode), value) in self.fields.iter().zip(values.iter()) {
             // AX represents missing attributes as CFNull or an AXValue error.
             if let Some(value) = decode(&value) {
                 fields.insert(name.into(), value);
