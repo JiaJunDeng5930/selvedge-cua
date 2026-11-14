@@ -40,6 +40,24 @@ Selvedge uses macOS 14 or later and the host application's Screen Recording
 and Accessibility permissions. JavaScript is embedded, and Rocq is only
 needed at build time.
 
+### Select Selvedge from Codex's @ menu
+
+Install the local Codex plugin to select **Selvedge** from the chat composer's
+@ menu. The plugin registers the same stdio MCP server and launches the
+executable inside the app bundle.
+
+```sh
+python3 platform/codex/package-plugin.py \
+  'target/release/Selvedge CUA MCP.app' target/release/selvedge-codex-marketplace
+codex plugin marketplace add "$PWD/target/release/selvedge-codex-marketplace"
+codex plugin add selvedge@selvedge-local
+```
+
+When migrating from the direct MCP configuration above, run
+`codex mcp remove selvedge-cua-mcp` after installing the plugin so the
+plugin owns the server registration. Reopen the desktop app to refresh
+the plugin list, then type `@Selvedge` in a local Codex chat.
+
 ## Write a script
 
 A script can return any JSON-serializable value. Native calls return promises
