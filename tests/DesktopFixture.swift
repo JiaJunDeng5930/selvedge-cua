@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import Dispatch
 
 if CommandLine.arguments.dropFirst() == ["--sample-pngs"] {
     struct Samples: Decodable {
@@ -132,6 +133,7 @@ final class Pulse: NSView {
 final class Delegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     let window = NSWindow(contentRect: NSRect(x: 200, y: 180, width: 710, height: 530),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
+    var secondary: NSWindow?
     let drawing = Drawing(frame: NSRect(x: 12, y: 12, width: 360, height: 454))
     let field = NSTextField(frame: NSRect(x: 12, y: 483, width: 235, height: 26))
     let button = NSButton(frame: NSRect(x: 250, y: 483, width: 124, height: 28))
@@ -189,6 +191,14 @@ final class Delegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     func controlTextDidChange(_ notification: Notification) {
         record("text", ["value": field.stringValue])
     }
+    @objc func showSecondary() {
+        let secondary = NSWindow(contentRect: NSRect(x: 85, y: 100, width: 160, height: 50),
+                                 styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        secondary.title = "Secondary Fixture Window"
+        secondary.orderFrontRegardless()
+        self.secondary = secondary
+        record("secondary", ["windowId": secondary.windowNumber])
+    }
     @objc func pressed() {
         record("pressed")
     }
@@ -207,4 +217,8 @@ let app = NSApplication.shared
 let delegate = Delegate()
 app.delegate = delegate
 app.setActivationPolicy(.regular)
+signal(SIGUSR1, SIG_IGN)
+let requests = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+requests.setEventHandler { delegate.showSecondary() }
+requests.resume()
 app.run()

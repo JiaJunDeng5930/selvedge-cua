@@ -1,6 +1,6 @@
-use std::time::Instant;
+use std::{num::NonZeroU32, time::Instant};
 
-use image::RgbaImage;
+use image::{DynamicImage, RgbaImage, imageops::FilterType};
 use serde::Serialize;
 
 mod capture;
@@ -52,6 +52,17 @@ impl Frame {
 
     pub fn dimensions(&self) -> (u32, u32) {
         self.pixels.dimensions()
+    }
+
+    pub fn limit_resolution(mut self, maximum: NonZeroU32) -> Self {
+        let (width, height) = self.dimensions();
+        let maximum = maximum.get();
+        if width.max(height) > maximum {
+            self.pixels = DynamicImage::ImageRgba8(self.pixels)
+                .resize(maximum, maximum, FilterType::Triangle)
+                .into_rgba8();
+        }
+        self
     }
 
     fn same_viewport(&self, other: &Self) -> bool {

@@ -1533,6 +1533,77 @@ Section UI.
   Proof. unfold action_dispatch_valid. intros [H _] different [E _]. congruence. Qed.
 End UI.
 
+(** An observer may have several windows from one application, or the
+    application may be in the background. Discovering and inspecting the
+    requested window must not require changing focus. AX can report a tree
+    even when the compositor cannot identify an input destination. These
+    outcomes require different recovery actions. *)
+Section WindowTargeting.
+  Context {App Window Layout : Type}.
+  Variable owner_at : Tick -> Window -> option App.
+  Variable exposed_at : Tick -> Window -> Prop.
+  Variable candidates_at : Tick -> list Window.
+  Variable input_layout_at : Tick -> Window -> option Layout.
+
+  Definition discovery_valid t app (windows : list Window) : Prop :=
+    forall window, In window windows <->
+      owner_at t window = Some app /\ exposed_at t window.
+
+  Definition exact_read_valid (requested : Window) (returned : option Window) : Prop :=
+    forall window, returned = Some window -> window = requested.
+
+  Inductive WindowObservation :=
+  | NoWindowMatch
+  | AmbiguousWindow
+  | WindowUnavailable (window : Window)
+  | InputReady (window : Window) (layout : Layout).
+
+  Definition window_observation_valid t observation : Prop :=
+    match observation with
+    | NoWindowMatch => candidates_at t = []
+    | AmbiguousWindow => exists a b rest, candidates_at t = a :: b :: rest
+    | WindowUnavailable window =>
+        candidates_at t = [window] /\ input_layout_at t window = None
+    | InputReady window layout =>
+        candidates_at t = [window] /\ input_layout_at t window = Some layout
+    end.
+
+  (* A plan uses a current layout. A window ID from a prior read identifies
+     the requested destination without freezing the operating system's layout. *)
+  Definition window_dispatch_valid planned sent window layout : Prop :=
+    planned <= sent /\ input_layout_at planned window = Some layout /\
+    input_layout_at sent window = Some layout.
+
+  Theorem invalidated_window_requires_reselection observed sent window layout :
+    input_layout_at sent window <> Some layout ->
+    ~ window_dispatch_valid observed sent window layout.
+  Proof. intros changed [_ [_ live]]. exact (changed live). Qed.
+End WindowTargeting.
+
+(** An overview can answer the task at a lower raster resolution. Its
+    viewport still refers to the same desktop area and observation time.
+    Native detail is the default when the caller gives no bound. *)
+Section Overview.
+  Context {DesktopArea : Type}.
+  Record Viewport := {
+    viewport_area : DesktopArea;
+    viewport_tick : Tick;
+    viewport_width : nat;
+    viewport_height : nat
+  }.
+
+  Definition overview_valid (maximum : nat) native overview : Prop :=
+    viewport_area overview = viewport_area native /\
+    viewport_tick overview = viewport_tick native /\
+    0 < viewport_width overview <= Nat.min maximum (viewport_width native) /\
+    0 < viewport_height overview <= Nat.min maximum (viewport_height native).
+
+  Theorem overview_keeps_desktop_area limit native overview :
+    overview_valid limit native overview ->
+    viewport_area overview = viewport_area native.
+  Proof. intros [area _]. exact area. Qed.
+End Overview.
+
 (** A script must be able to observe a result and choose the next
     request. A fixed sequence cannot in general replace this ability:
     distinct observed states can require incompatible next actions.

@@ -118,11 +118,11 @@ impl State {
 
     // Preparation and acknowledgement cannot be interleaved with another
     // transition. A failed platform send leaves the previous state in place.
-    pub fn dispatch(
+    pub fn dispatch<E: From<String>>(
         &mut self,
         change: Change,
-        send: impl FnOnce() -> Result<(), String>,
-    ) -> Result<(), String> {
+        send: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
         let next = result(input_rules::apply_transition(
             self.held.clone(),
             change.into(),

@@ -7,4 +7,5 @@ Rocq2Rust Export Library "rules.rs"
   Schedule.sample_times
   ObservationRules.group_frames ObservationRules.local_change ObservationRules.same_scroll
   ObservationRules.pack_images
-  AccessibilityRules.retained_read AccessibilityRules.reference_live AccessibilityRules.authorize_insertion.
+  AccessibilityRules.retained_read AccessibilityRules.reference_live AccessibilityRules.authorize_insertion
+  AccessibilityRules.choose_window.

@@ -2,9 +2,10 @@
 //! snapshot between events. The mutex pairs each native send with its Rocq
 //! acknowledgement. It is released during timed waits.
 use crate::locked_use::DesktopPermission;
-use selvedge_macos_ax::{self as ax, InputProcess, InputWindow};
+use selvedge_macos_ax::{self as ax, InputProcess, InputWindow, InputWindowError};
 use selvedge_macos_input::{self as native, Point, WindowRoute};
 use selvedge_rules::input::{Change, Held, State};
+use selvedge_script_server::OperationError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -16,6 +17,10 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_DURATION_MS: f64 = 30_000.0;
 const MAX_STEPS: usize = 1024;
+
+fn window_error(error: InputWindowError) -> OperationError {
+    OperationError::coded(error.code(), error.to_string())
+}
 
 #[derive(Default)]
 pub struct Input {
@@ -41,8 +46,8 @@ struct Target {
 }
 
 impl Target {
-    fn window(id: u32) -> Result<Self, String> {
-        let window = ax::input_window(id)?;
+    fn window(id: u32) -> Result<Self, OperationError> {
+        let window = ax::input_window(id).map_err(window_error)?;
         Ok(Self {
             process: window.process(),
             window: Some(window),
@@ -165,10 +170,10 @@ impl Input {
         clock: Instant,
         cancel: CancellationToken,
         permission: &DesktopPermission,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, OperationError> {
         let _dispatch = self.dispatch.lock().await;
         if plan.samples.len() > MAX_STEPS {
-            return Err(format!("At most {MAX_STEPS} pointer samples are allowed"));
+            return Err(format!("At most {MAX_STEPS} pointer samples are allowed").into());
         }
         // DEFENSE: JavaScript may supply an unsupported button or repeat one
         // already listed, which would otherwise send a partially valid drag.
@@ -237,10 +242,10 @@ impl Input {
         clock: Instant,
         cancel: CancellationToken,
         permission: &DesktopPermission,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, OperationError> {
         let _dispatch = self.dispatch.lock().await;
         if plan.events.len() > MAX_STEPS {
-            return Err(format!("At most {MAX_STEPS} keyboard events are allowed"));
+            return Err(format!("At most {MAX_STEPS} keyboard events are allowed").into());
         }
         let active = self.active_target(plan.operation)?;
         let target = match plan.pid {
@@ -284,10 +289,10 @@ impl Input {
         clock: Instant,
         cancel: CancellationToken,
         permission: &DesktopPermission,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, OperationError> {
         let _dispatch = self.dispatch.lock().await;
         if plan.events.is_empty() || plan.events.len() > MAX_STEPS {
-            return Err(format!("Scroll requires between 1 and {MAX_STEPS} events"));
+            return Err(format!("Scroll requires between 1 and {MAX_STEPS} events").into());
         }
         let target = self.window_target(plan.window_id, plan.operation)?;
         let at = point(plan.x, plan.y)?;
@@ -332,7 +337,7 @@ impl Input {
         &self,
         window_id: Option<u32>,
         reference: Option<u64>,
-    ) -> Result<Target, String> {
+    ) -> Result<Target, OperationError> {
         let active = self.active_target(reference)?;
         let bound = active.filter(|target| target.window.is_some());
         let target = match (bound, window_id) {
@@ -340,17 +345,19 @@ impl Input {
             (Some(target), Some(id)) if target.window.is_some_and(|window| window.id() == id) => {
                 target
             }
-            (_, Some(id)) => Target::window(id)?,
+            (_, Some(id)) => return Target::window(id),
             (None, None) => {
-                return Err(
-                    "Pointer and scroll require a windowId or a window-bound operation".into(),
-                );
+                return Err(OperationError::coded(
+                    "windowRequired",
+                    "Pointer and scroll require a windowId or a window-bound operation",
+                ));
             }
         };
         target
             .window
             .expect("the target contains a window")
-            .revalidate()?;
+            .revalidate()
+            .map_err(window_error)?;
         Ok(target)
     }
 
@@ -362,7 +369,7 @@ impl Input {
         clock: Instant,
         cancel: CancellationToken,
         permission: &DesktopPermission,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, OperationError> {
         if cancel.is_cancelled() {
             return Err("Input was cancelled before dispatch".into());
         }
@@ -416,7 +423,7 @@ impl Input {
                 break;
             }
             if let Err(error) = permission.check().await {
-                failure = Some(error);
+                failure = Some(error.into());
                 break;
             }
             if cancel.is_cancelled() {
@@ -447,12 +454,17 @@ impl Input {
         result["events"] = json!(events);
         result["releases"] = json!(releases);
         result["finishedAtMs"] = json!(clock.elapsed().as_secs_f64() * 1000.0);
-        let failure = match (failure, cleanup) {
+        let mut failure = match (failure, cleanup) {
             (None, Ok(())) => return Ok(result),
-            (Some(error), Ok(())) | (None, Err(error)) => error,
-            (Some(error), Err(cleanup)) => format!("{error}; release failed: {cleanup}"),
+            (Some(error), Ok(())) => error,
+            (None, Err(error)) => error.into(),
+            (Some(mut error), Err(cleanup)) => {
+                error.message = format!("{}; release failed: {cleanup}", error.message);
+                error
+            }
         };
-        Err(format!("{failure}; partial dispatch receipt: {result}"))
+        failure.message = format!("{}; partial dispatch receipt: {result}", failure.message);
+        Err(failure)
     }
 
     pub async fn exclusive<T>(&self, operation: impl Future<Output = T>) -> T {
@@ -553,7 +565,8 @@ impl DispatchState {
     }
 
     fn release_control(&mut self, held: Held, clock: Instant) -> Result<Value, String> {
-        self.send(Event::Release(held))?;
+        self.send(Event::Release(held))
+            .map_err(|error| error.message)?;
         Ok(json!({
             "control": match held {
                 Held::Mouse(button) => json!({"button":button}),
@@ -563,7 +576,7 @@ impl DispatchState {
         }))
     }
 
-    fn send(&mut self, event: Event) -> Result<(), String> {
+    fn send(&mut self, event: Event) -> Result<(), OperationError> {
         let mut buttons = Vec::new();
         let mut modifiers = Vec::new();
         for held in self.rules.held() {
@@ -608,7 +621,8 @@ impl DispatchState {
                 target
                     .window
                     .expect("a pointing event has a window")
-                    .revalidate()?;
+                    .revalidate()
+                    .map_err(window_error)?;
             }
             let result = match event {
                 Event::Move(point) => {
@@ -663,7 +677,7 @@ impl DispatchState {
                 }
             };
             posted = result.is_ok();
-            result
+            result.map_err(Into::into)
         });
         self.dispatch_epoch += 2 * u64::from(posted);
         result

@@ -21,6 +21,8 @@ Print Assumptions local_change_contract.
 Print Assumptions same_scroll_contract.
 Print Assumptions reference_live_contract.
 Print Assumptions authorize_insertion_contract.
+Print Assumptions choose_window_geometry_contract.
+Print Assumptions choose_window_title_contract.
 Print Assumptions pack_images_contract.
 
 Require Import Requirement.
@@ -31,6 +33,8 @@ Print Assumptions spontaneous_effect_refutes_background.
 
 Print Assumptions first_destination.
 Print Assumptions continuation_preserves_destination.
+Print Assumptions invalidated_window_requires_reselection.
+Print Assumptions overview_keeps_desktop_area.
 
 Require Import LockedUseRequirement.
 Print Assumptions confirmation_matches_contract.

@@ -6,10 +6,10 @@ use crate::{
     locked_use::{DesktopPermission, LockedUse},
 };
 use selvedge_macos_screen::{self as screen, TimedFrame};
-use selvedge_script_server::{Operation, Response};
+use selvedge_script_server::{Operation, OperationError, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{path::PathBuf, time::Duration};
+use std::{num::NonZeroU32, path::PathBuf, time::Duration};
 use tokio::{
     sync::{Mutex, oneshot},
     task::spawn_blocking,
@@ -119,7 +119,19 @@ impl Desktop {
             }
             capture_at = (at + interval).min(end);
         }
-        let observation = blocking(move || screen::summarize(frames, budget)).await?;
+        let observation = blocking(move || {
+            let frames = frames
+                .into_iter()
+                .map(|mut sample| {
+                    if let Some(maximum) = observation.max_dimension {
+                        sample.frame = sample.frame.limit_resolution(maximum);
+                    }
+                    sample
+                })
+                .collect();
+            screen::summarize(frames, budget)
+        })
+        .await?;
         Ok(Response {
             value: observation.metadata,
             images: observation.images,
@@ -138,25 +150,29 @@ impl selvedge_script_server::Desktop for Desktop {
         options: Value,
         started: Option<oneshot::Sender<Result<Value, String>>>,
         cancel: CancellationToken,
-    ) -> Result<Response, String> {
+    ) -> Result<Response, OperationError> {
         let permission = match self.locked_use.acquire(&cancel).await {
             Ok(permission) => permission,
             Err(error) => {
                 if let Some(started) = started {
                     let _ = started.send(Err(error.clone()));
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
         match name {
-            Operation::ReadUi | Operation::Pointer | Operation::Keyboard | Operation::Scroll => {
+            Operation::ReadUi
+            | Operation::ListWindows
+            | Operation::Pointer
+            | Operation::Keyboard
+            | Operation::Scroll => {
                 permission.check().await?;
             }
             _ => {}
         }
         let value = match name {
             Operation::ObserveScreen => {
-                return self.observe(options, started, cancel, &permission).await;
+                return Ok(self.observe(options, started, cancel, &permission).await?);
             }
             Operation::ReadUi => {
                 let mut ui = blocking(move || {
@@ -169,6 +185,15 @@ impl selvedge_script_server::Desktop for Desktop {
                 ui["atMs"] = json!(self.clock.elapsed().as_secs_f64() * 1000.0);
                 ui["input"] = self.input.snapshot();
                 ui
+            }
+            Operation::ListWindows => {
+                blocking(move || {
+                    if cancel.is_cancelled() {
+                        return Err("Listing windows was cancelled".into());
+                    }
+                    selvedge_macos_ax::list_windows(&options)
+                })
+                .await?
             }
             Operation::Pointer => {
                 self.input
@@ -255,6 +280,7 @@ struct Observation {
     duration_ms: f64,
     interval_ms: Option<f64>,
     image_budget: Option<usize>,
+    max_dimension: Option<NonZeroU32>,
     #[serde(default)]
     preserve_input_boundaries: bool,
 }

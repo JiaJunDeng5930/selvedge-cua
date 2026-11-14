@@ -115,24 +115,35 @@ pub fn element_attribute(element: &AXUIElement, name: &str) -> Result<Option<Ele
 }
 
 pub fn only_window(application: &AXUIElement) -> Result<Option<Element>, Error> {
-    let Some(windows) = attribute(application, "AXWindows")? else {
+    let mut windows = windows(application)?;
+    if windows.len() != 1 {
         return Ok(None);
+    }
+    let window = windows.remove(0);
+    let minimized = attribute(&window, "AXMinimized")?.and_then(|value| boolean(&value));
+    let is_window = role(&window)?.as_deref() == Some("AXWindow");
+    Ok((is_window && minimized != Some(true)).then_some(window))
+}
+
+pub fn windows(application: &AXUIElement) -> Result<Vec<Element>, Error> {
+    let Some(windows) = attribute(application, "AXWindows")? else {
+        return Ok(Vec::new());
     };
     let windows = windows
         .downcast::<CFArray>()
         .map_err(|_| Error::UnexpectedResponse("AXWindows"))?;
-    let windows = array(windows);
-    if windows.len() != 1 {
-        return Ok(None);
-    }
-    let window = windows
+    array(windows)
         .iter()
-        .next()
-        .and_then(|element| element.downcast::<AXUIElement>().ok())
-        .ok_or(Error::UnexpectedResponse("AXWindows"))?;
-    let minimized = attribute(&window, "AXMinimized")?.and_then(|value| boolean(&value));
-    let is_window = role(&window)?.as_deref() == Some("AXWindow");
-    Ok((is_window && minimized != Some(true)).then_some(window))
+        .map(|element| {
+            element
+                .downcast::<AXUIElement>()
+                .map_err(|_| Error::UnexpectedResponse("AXWindows"))
+        })
+        .collect()
+}
+
+pub fn containing_window(element: &AXUIElement) -> Result<Option<Element>, Error> {
+    element_attribute(element, "AXWindow")
 }
 
 pub fn role(element: &AXUIElement) -> Result<Option<String>, Error> {

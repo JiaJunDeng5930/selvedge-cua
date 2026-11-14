@@ -4,6 +4,23 @@ use crate::{
     corelib::init::datatypes::Bool,
 };
 
+pub enum WindowMatch {
+    Unmatched,
+    Ambiguous,
+    Geometry,
+    Title,
+}
+
+pub fn choose_window(geometry: usize, title: usize) -> WindowMatch {
+    use accessibility_rules::WindowMatch as Rule;
+    match accessibility_rules::choose_window(n(geometry as u64), n(title as u64)) {
+        Rule::Unmatched => WindowMatch::Unmatched,
+        Rule::Ambiguous => WindowMatch::Ambiguous,
+        Rule::Geometry => WindowMatch::Geometry,
+        Rule::Title => WindowMatch::Title,
+    }
+}
+
 pub fn retained_read(age: usize) -> bool {
     matches!(
         accessibility_rules::retained_read(n(age as u64)),

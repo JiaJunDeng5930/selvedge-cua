@@ -74,19 +74,28 @@ the plugin list, then type `@Selvedge` in a local Codex chat.
 ## Write a script
 
 A script can return any JSON-serializable value. Native calls return promises
-and report errors as rejections. The following example assumes the script
-already knows the target application's PID as `targetPid`.
+and report errors as rejections. This example finds a Chrome drawing board
+without changing the foreground app.
 
 ```js
-const ui = await readUI({ pid: targetPid });
-const windowId = ui.window.windowId;
+const { windows } = await listWindows({ bundleId: "com.google.Chrome" });
+const boards = windows.filter(window => window.title?.startsWith("石墨画板"));
+if (boards.length !== 1) throw new Error("Select one drawing board");
+const { windowId } = boards[0];
+const ui = await readUI({ windowId });
+if (ui.windowInput.status !== "ready") return ui.windowInput;
+const findPaper = node => node.description === "素描画纸"
+  ? node : node.children.map(findPaper).find(Boolean);
+const paper = findPaper(ui.window);
+if (!paper?.position) throw new Error("Drawing surface unavailable");
 const observation = observeScreen({
   target: { windowId },
   durationMs: 700,
   preserveInputBoundaries: true,
+  maxDimension: 900,
 });
 await observation.started;
-const point = ui.focused.position;
+const point = paper.position;
 await pointer({
   windowId,
   position: t => ({ x: point.x + 20 + t / 4, y: point.y + 10 + t * t / 2000 }),
@@ -98,8 +107,9 @@ return await observation.finished;
 
 | Function | Options and behavior |
 | --- | --- |
-| `observeScreen` | `{durationMs?, intervalMs?, imageBudget?, preserveInputBoundaries?, target?}`. A zero duration gives one frame. The default target is the main display. Set `target` to `{displayId}`, `{windowId}`, or `{region: {x, y, width, height}}`. Await `.started` for the first frame's time. Await the observation directly or via `.finished` for the image manifest. Set `preserveInputBoundaries: true` to keep identical samples taken after different completed input dispatches. |
-| `readUI` | `{pid?, maxDepth?, maxNodes?, fields?}`. The default PID is the foreground app. Returns its focused element, window tree, input snapshot and observation time. A matching on-screen window also exposes `windowId`. |
+| `observeScreen` | `{durationMs?, intervalMs?, imageBudget?, preserveInputBoundaries?, target?, maxDimension?}`. A zero duration gives one frame. The default target is the main display. Set `target` to `{displayId}`, `{windowId}`, or `{region: {x, y, width, height}}`. A positive `maxDimension` caps the longest side of each sampled viewport in pixels without enlarging smaller frames. Await `.started` for the first frame's time. Await the observation directly or via `.finished` for the image manifest. Set `preserveInputBoundaries: true` to keep identical samples taken after different completed input dispatches. |
+| `listWindows` | `{bundleId}` or `{pid}`. Returns `{windows}` with `windowId`, `pid`, `title`, `bounds` as `[x, y, width, height]`, and `onScreen`. macOS may omit window titles. |
+| `readUI` | `{pid?, windowId?, maxDepth?, maxNodes?, fields?}`. Pass at most one of `pid` and `windowId`. By default reads the foreground app's current window. Returns the window tree, focused element, input snapshot, observation time and `windowInput`. With an explicit window ID the focused element belongs to that window, if observed. |
 | `pointer` | `{windowId?, position, durationMs?, intervalMs?, buttons?, hold?, operation?}`. A new trajectory requires a window ID. The function receives the elapsed milliseconds and returns `{x, y}`. The default duration is zero and the default sample interval is 16 ms. Buttons 0, 1 and 2 correspond to left, right and middle. |
 | `keyboard` | `{pid?, events, hold?, operation?}`. Supply the PID for a new keyboard operation. Each event is `{atMs?, key, down}`. Physical key names use `KeyboardEvent.code` names such as `KeyA`, `ShiftLeft` and `ArrowDown`. |
 | `scroll` | `{windowId?, x, y, events, operation?}`. Supply a window ID or a window-bound operation. Each event is `{atMs?, dx?, dy?}` in pixels. Positive deltas scroll right and down. Passing an operation preserves its held controls. |
@@ -111,7 +121,12 @@ Omit `readUI.fields` for all node attributes. Pass a list containing any of
 `enabled`, `identifier`, `help`, `placeholder`, `actions`, and `settable`
 to limit the attributes read and returned. Each node still provides its
 `role` and `target`, the window tree retains its children, and the root
-still includes a matching `windowId`.
+includes `windowId` when `windowInput.status` is `ready`. The other statuses are
+`unmatched`, `ambiguous`, and `unavailable`. An unavailable status includes
+the ID of the absent or off-screen window. Input rechecks window identity
+and geometry. Pointer and scroll rejections expose `windowRequired`,
+`windowUnavailable`, `windowOwnerChanged`, or `windowGeometryChanged` in
+JavaScript's `error.code` and in `structuredContent.code` for uncaught errors.
 
 Times with the `AtMs` suffix are measured in milliseconds since the server
 started. Event offsets are relative to the start of their input plan. Pointer
@@ -137,6 +152,8 @@ Add `imageOffset` to a tile's `imageIndex` to locate the attachment. The tile's
 the source in desktop points. Use the manifest's `viewport` for the last real
 capture. Each tile carries its representative capture time and the bounds of
 the sample interval it represents. These times record macOS capture delivery.
+The same desktop coordinates apply at every output resolution. A mosaic can
+cover several viewports, so `maxDimension` bounds each sample.
 
 Consecutive equivalent captures share one interval. If the sampled sequence is
 A, A, A, B, A, the three intervals show whole frames A, B, A. Aligned scrolling
@@ -162,7 +179,7 @@ unlock prompt.
 Set the MCP server's arguments to
 `--locked-use-helper /absolute/path/to/the/signed/helper`. The helper path is
 set by the operator who starts the MCP server. Scripts use the same `run`
-tool and seven JavaScript functions. A script that does no desktop work does
+tool and JavaScript functions. A script that does no desktop work does
 not start a helper. See the [macOS build and deployment instructions](platform/locked-use/README.md).
 
 While a protected session is active, `observeScreen` requires

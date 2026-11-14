@@ -15,6 +15,35 @@ use serde_json::{Map, Value};
 type WindowDescription = CFDictionary<CFString, CFType>;
 type DesktopBounds = (f64, f64, f64, f64);
 
+#[derive(Debug)]
+pub enum InputWindowError {
+    Unavailable(u32),
+    OwnerChanged(u32),
+    GeometryChanged(u32),
+}
+
+impl InputWindowError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Unavailable(_) => "windowUnavailable",
+            Self::OwnerChanged(_) => "windowOwnerChanged",
+            Self::GeometryChanged(_) => "windowGeometryChanged",
+        }
+    }
+}
+
+impl std::fmt::Display for InputWindowError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(id) => {
+                write!(formatter, "window {id} is not a normal on-screen window")
+            }
+            Self::OwnerChanged(id) => write!(formatter, "window {id} changed owner"),
+            Self::GeometryChanged(id) => write!(formatter, "window {id} moved or resized"),
+        }
+    }
+}
+
 /// A normal, on-screen window and the process generation that owned it when
 /// resolved. The bounds use the desktop coordinates used by Core Graphics.
 #[derive(Clone, Copy, Debug)]
@@ -43,15 +72,15 @@ impl InputWindow {
 
     /// Recheck the original owner and frame before using a prepared input
     /// plan. The plan's coordinates were validated against the original frame.
-    pub fn revalidate(&self) -> Result<(), String> {
+    pub fn revalidate(&self) -> Result<(), InputWindowError> {
         let current = input_window(self.id)?;
         // DEFENSE: Window bounds, visibility, and owner can change while
         // a script prepares the input plan.
         if current.process != self.process {
-            return Err(format!("window {} changed owner", self.id));
+            return Err(InputWindowError::OwnerChanged(self.id));
         }
         if current.bounds != self.bounds {
-            return Err(format!("window {} moved or resized", self.id));
+            return Err(InputWindowError::GeometryChanged(self.id));
         }
         Ok(())
     }
@@ -65,33 +94,192 @@ impl InputWindow {
 
 /// Resolve a window ID from the same desktop session as the tool. This query
 /// reads window metadata without activating its owner.
-pub fn input_window(id: u32) -> Result<InputWindow, String> {
+pub fn input_window(id: u32) -> Result<InputWindow, InputWindowError> {
     let options =
         CGWindowListOption::OptionIncludingWindow | CGWindowListOption::ExcludeDesktopElements;
-    let (pid, bounds) = window_list(options, id)
+    let window = window_list(options, id)
         .and_then(|windows| {
             windows.iter().find_map(|window| {
-                if number(&window, keys::number())?.as_i64()? != i64::from(id)
-                    || number(&window, keys::layer())?.as_i32()? != kCGNormalWindowLevel
-                    || !window
-                        .get(keys::onscreen())?
-                        .downcast_ref::<CFBoolean>()?
-                        .as_bool()
-                {
-                    return None;
-                }
-                let pid = number(&window, keys::owner())?.as_i32()?;
-                let bounds = bounds(&window)?;
-                (pid > 0 && bounds.2 > 0.0 && bounds.3 > 0.0).then_some((pid, bounds))
+                let geometry = WindowGeometry::from_native(&window)?;
+                (geometry.id == id && geometry.on_screen).then_some(geometry)
             })
         })
-        .ok_or_else(|| format!("window {id} is not a normal on-screen window"))?;
-    let process = input_process(pid)?;
+        .ok_or(InputWindowError::Unavailable(id))?;
     Ok(InputWindow {
         id,
-        process,
-        bounds,
+        process: InputProcess::read(window.pid).ok_or(InputWindowError::Unavailable(id))?,
+        bounds: window.bounds,
     })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WindowInfo {
+    pub window_id: u32,
+    pub pid: i32,
+    title: Option<String>,
+    bounds: DesktopBounds,
+    pub on_screen: bool,
+}
+
+struct WindowGeometry {
+    id: u32,
+    pid: i32,
+    bounds: DesktopBounds,
+    on_screen: bool,
+}
+
+impl WindowGeometry {
+    fn from_native(window: &WindowDescription) -> Option<Self> {
+        let pid = number(window, keys::owner())?.as_i32()?;
+        let bounds = bounds(window)?;
+        if pid <= 0
+            || bounds.2 <= 0.0
+            || bounds.3 <= 0.0
+            || number(window, keys::layer())?.as_i32()? != kCGNormalWindowLevel
+        {
+            return None;
+        }
+        Some(Self {
+            id: u32::try_from(number(window, keys::number())?.as_i64()?).ok()?,
+            pid,
+            bounds,
+            on_screen: window
+                .get(keys::onscreen())
+                .and_then(|value| value.downcast_ref::<CFBoolean>().map(|flag| flag.value()))
+                .unwrap_or(false),
+        })
+    }
+}
+
+impl WindowInfo {
+    fn from_native(window: &WindowDescription) -> Option<Self> {
+        let geometry = WindowGeometry::from_native(window)?;
+        Some(Self {
+            window_id: geometry.id,
+            pid: geometry.pid,
+            bounds: geometry.bounds,
+            on_screen: geometry.on_screen,
+            title: window
+                .get(keys::title())
+                .and_then(|value| value.downcast_ref::<CFString>().map(ToString::to_string)),
+        })
+    }
+
+    pub fn lookup(id: u32) -> Option<Self> {
+        let options =
+            CGWindowListOption::OptionIncludingWindow | CGWindowListOption::ExcludeDesktopElements;
+        window_list(options, id)?
+            .iter()
+            .filter_map(|window| Self::from_native(&window))
+            .find(|window| window.window_id == id)
+    }
+
+    pub fn list() -> Option<Vec<Self>> {
+        Some(
+            window_list(CGWindowListOption::ExcludeDesktopElements, 0)?
+                .iter()
+                .filter_map(|window| Self::from_native(&window))
+                .collect(),
+        )
+    }
+
+    fn matches(&self, pid: i32, geometry: &Geometry<'_>) -> bool {
+        // The two APIs can round a fractional point boundary differently.
+        self.pid == pid
+            && [self.bounds.0, self.bounds.1, self.bounds.2, self.bounds.3]
+                .into_iter()
+                .zip(geometry.bounds)
+                .all(|(a, b)| (a - b).abs() < 1.0)
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub(crate) enum WindowInput {
+    Ready { window_id: u32 },
+    Unmatched,
+    Ambiguous,
+    Unavailable { window_id: u32 },
+}
+
+impl WindowInput {
+    fn from_match(window: &WindowInfo) -> Self {
+        let window_id = window.window_id;
+        if window.on_screen {
+            Self::Ready { window_id }
+        } else {
+            Self::Unavailable { window_id }
+        }
+    }
+
+    pub fn id(&self) -> Option<u32> {
+        match *self {
+            Self::Ready { window_id } | Self::Unavailable { window_id } => Some(window_id),
+            Self::Unmatched | Self::Ambiguous => None,
+        }
+    }
+}
+
+struct Geometry<'a> {
+    bounds: [f64; 4],
+    title: Option<&'a str>,
+}
+
+impl<'a> Geometry<'a> {
+    fn from_ax(window: &'a Map<String, Value>) -> Option<Self> {
+        let position = window.get("position")?;
+        let size = window.get("size")?;
+        Some(Self {
+            bounds: [
+                position.get("x")?.as_f64()?,
+                position.get("y")?.as_f64()?,
+                size.get("width")?.as_f64()?,
+                size.get("height")?.as_f64()?,
+            ],
+            title: window.get("title").and_then(Value::as_str),
+        })
+    }
+}
+
+pub(crate) fn find(windows: &[WindowInfo], pid: i32, window: &Map<String, Value>) -> WindowInput {
+    use selvedge_rules::accessibility::{WindowMatch, choose_window};
+
+    let Some(geometry) = Geometry::from_ax(window) else {
+        return WindowInput::Unmatched;
+    };
+    let candidates: Vec<_> = windows
+        .iter()
+        .filter(|window| window.matches(pid, &geometry))
+        .collect();
+    let named: Vec<_> = candidates
+        .iter()
+        .filter(|window| geometry.title.is_some() && geometry.title == window.title.as_deref())
+        .collect();
+    match choose_window(candidates.len(), named.len()) {
+        WindowMatch::Unmatched => WindowInput::Unmatched,
+        WindowMatch::Ambiguous => WindowInput::Ambiguous,
+        WindowMatch::Geometry => WindowInput::from_match(candidates[0]),
+        WindowMatch::Title => WindowInput::from_match(named[0]),
+    }
+}
+
+pub(crate) fn may_match(
+    windows: &[WindowInfo],
+    pid: i32,
+    id: u32,
+    window: &Map<String, Value>,
+) -> bool {
+    let Some(geometry) = Geometry::from_ax(window) else {
+        return false;
+    };
+    windows
+        .iter()
+        .any(|window| window.window_id == id && window.matches(pid, &geometry))
 }
 
 /// The owner PID and the kernel time at which that process started.
@@ -155,35 +343,6 @@ impl InputProcess {
     }
 }
 
-pub fn find(pid: i32, window: &Map<String, Value>) -> Option<u32> {
-    let position = window.get("position")?;
-    let size = window.get("size")?;
-    let geometry = [
-        position.get("x")?.as_f64()?,
-        position.get("y")?.as_f64()?,
-        size.get("width")?.as_f64()?,
-        size.get("height")?.as_f64()?,
-    ];
-    let windows = window_list(CGWindowListOption::ExcludeDesktopElements, 0)?;
-    let title = window.get("title").and_then(Value::as_str);
-    let matches: Vec<_> = windows
-        .iter()
-        .filter_map(|window| candidate(&window, pid, geometry, title))
-        .collect();
-    match matches.as_slice() {
-        [(id, _)] => Some(*id),
-        _ => {
-            // KNOWN LIMITATION: Public metadata may give multiple windows
-            // the same frame and title, or omit titles due to capture permissions.
-            let mut title_matches = matches
-                .into_iter()
-                .filter(|(_, title_matches)| *title_matches);
-            let (id, _) = title_matches.next()?;
-            title_matches.next().is_none().then_some(id)
-        }
-    }
-}
-
 fn window_list(
     options: CGWindowListOption,
     id: u32,
@@ -212,35 +371,6 @@ fn bounds(window: &WindowDescription) -> Option<DesktopBounds> {
         rect.size.width,
         rect.size.height,
     ))
-}
-
-fn candidate(
-    window: &WindowDescription,
-    pid: i32,
-    geometry: [f64; 4],
-    title: Option<&str>,
-) -> Option<(u32, bool)> {
-    if number(window, keys::owner())?.as_i32()? != pid {
-        return None;
-    }
-    let (x, y, width, height) = bounds(window)?;
-    // The two APIs can round a fractional point boundary differently.
-    if [x, y, width, height]
-        .into_iter()
-        .zip(geometry)
-        .any(|(a, b)| (a - b).abs() >= 1.0)
-    {
-        return None;
-    }
-    let id = u32::try_from(number(window, keys::number())?.as_i64()?).ok()?;
-    let title_matches = title.is_some_and(|title| {
-        window.get(keys::title()).is_some_and(|value| {
-            value
-                .downcast_ref::<CFString>()
-                .is_some_and(|name| name.to_string() == title)
-        })
-    });
-    Some((id, title_matches))
 }
 
 mod keys {

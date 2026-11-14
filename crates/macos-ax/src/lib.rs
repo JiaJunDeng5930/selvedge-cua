@@ -17,12 +17,14 @@ use std::thread;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
 use objc2_core_foundation::{CFBoolean, CFNumber, CFString, CFType};
+use objc2_foundation::NSString;
 use selvedge_rules::accessibility;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use native::{Attributes, Element};
-pub use window_id::{InputProcess, InputWindow, input_process, input_window};
+pub use window_id::{InputProcess, InputWindow, InputWindowError, input_process, input_window};
+use window_id::{WindowInfo, WindowInput};
 
 type Job = Box<dyn FnOnce(&mut Accessibility) + Send>;
 
@@ -41,7 +43,41 @@ pub fn read_ui(options: &Value) -> Result<Value, String> {
     let options: ReadOptions = decode(options, "readUI")?;
     let limits = ReadLimits::from_options(&options)?;
     let fields = ReadFields::new(options.fields)?;
-    submit(move |accessibility| accessibility.read(options.pid, limits, fields))
+    submit(move |accessibility| {
+        let selection = match (options.pid, options.window_id) {
+            (None, None) => WindowSelection::Frontmost,
+            (Some(pid), None) => WindowSelection::Application(pid),
+            (None, Some(id)) => WindowSelection::Window(id),
+            (Some(_), Some(_)) => return Err("readUI accepts either pid or windowId".into()),
+        };
+        accessibility.read(selection, limits, fields)
+    })
+}
+
+/// List normal compositor windows of an application without changing focus.
+pub fn list_windows(options: &Value) -> Result<Value, String> {
+    let options: ListOptions = decode(options, "listWindows")?;
+    autoreleasepool(|_| {
+        let pids = match (options.pid, options.bundle_id) {
+            (Some(pid), None) => vec![pid],
+            (None, Some(bundle_id)) if !bundle_id.is_empty() => {
+                let bundle_id = NSString::from_str(&bundle_id);
+                NSRunningApplication::runningApplicationsWithBundleIdentifier(&bundle_id)
+                    .to_vec()
+                    .into_iter()
+                    .filter(|application| !application.isTerminated())
+                    .map(|application| application.processIdentifier())
+                    .collect()
+            }
+            _ => return Err("listWindows requires either pid or a nonempty bundleId".into()),
+        };
+        let windows: Vec<_> = WindowInfo::list()
+            .ok_or("macOS did not provide a window list")?
+            .into_iter()
+            .filter(|window| pids.contains(&window.pid))
+            .collect();
+        Ok(json!({ "windows": windows }))
+    })
 }
 
 /// Apply a native action or set a writable AXValue attribute. The target
@@ -144,9 +180,23 @@ fn decode<T: serde::de::DeserializeOwned>(options: &Value, function: &str) -> Re
 #[serde(rename_all = "camelCase")]
 struct ReadOptions {
     pid: Option<i32>,
+    window_id: Option<u32>,
     max_depth: Option<usize>,
     max_nodes: Option<usize>,
     fields: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ListOptions {
+    pid: Option<i32>,
+    bundle_id: Option<String>,
+}
+
+enum WindowSelection {
+    Frontmost,
+    Application(i32),
+    Window(u32),
 }
 
 #[derive(Deserialize)]
@@ -338,21 +388,52 @@ impl Accessibility {
 
     fn read(
         &mut self,
-        pid: Option<i32>,
+        selection: WindowSelection,
         limits: ReadLimits,
         fields: ReadFields,
     ) -> Result<Value, String> {
-        let application = match pid {
-            Some(pid) => NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
-                .filter(|application| pid > 0 && !application.isTerminated())
-                .ok_or_else(|| format!("no running application with PID {pid}"))?,
-            None => frontmost_application()?,
+        let (requested, application) = match selection {
+            WindowSelection::Frontmost => (None, frontmost_application()?),
+            WindowSelection::Application(pid) => (None, running_application(pid)?),
+            WindowSelection::Window(id) => {
+                // DEFENSE: An app can quit after Core Graphics reports its window.
+                let Some(application) =
+                    WindowInfo::lookup(id).and_then(|window| running_application(window.pid).ok())
+                else {
+                    return Ok(json!({
+                        "pid": null, "window": null, "focused": null, "truncated": false,
+                        "windowInput": WindowInput::Unavailable { window_id: id },
+                    }));
+                };
+                (Some(id), application)
+            }
         };
         let pid = application.processIdentifier();
         let ax = native::application(pid);
-        let window = current_window(&ax).map_err(|error| error.to_string())?;
+        let (window, mut window_input) = match requested {
+            Some(id) => {
+                let windows = WindowInfo::list().ok_or("macOS did not provide a window list")?;
+                exact_window(&ax, &windows, pid, id)?
+            }
+            None => (
+                current_window(&ax).map_err(|error| error.to_string())?,
+                WindowInput::Unmatched,
+            ),
+        };
         let focused = native::element_attribute(&ax, "AXFocusedUIElement")
             .map_err(|error| error.to_string())?;
+        let focused = match (&window, focused) {
+            (_, focused) if requested.is_none() => focused,
+            (Some(window), Some(focused)) => {
+                let in_window = *focused == **window
+                    || native::containing_window(&focused)
+                        .map_err(|error| error.to_string())?
+                        .as_ref()
+                        .is_some_and(|owner| **owner == **window);
+                in_window.then_some(focused)
+            }
+            _ => None,
+        };
         let attributes = fields
             .0
             .as_ref()
@@ -373,18 +454,21 @@ impl Accessibility {
             max_depth: limits.depth,
             truncated: false,
         };
+        let selected = window.is_some();
         let mut window = window
             .map(|window| read.tree(window, 0))
             .transpose()
             .map_err(|error| error.to_string())?
             .flatten();
-        let focused = focused
+        let mut focused = focused
             .map(|focused| read.describe(focused, false))
             .transpose()
             .map_err(|error| error.to_string())?
             .flatten();
         if let Some(Value::Object(window)) = &mut window {
-            if let Some(window_id) = window_id::find(pid, window) {
+            let windows = WindowInfo::list().ok_or("macOS did not provide a window list")?;
+            window_input = window_id::find(&windows, pid, window);
+            if let WindowInput::Ready { window_id } = window_input {
                 window.insert("windowId".into(), json!(window_id));
             }
             for field in ["position", "size", "title"] {
@@ -393,11 +477,24 @@ impl Accessibility {
                 }
             }
         }
+        // DEFENSE: The selected AX window can move or disappear while its tree is read.
+        if let Some(id) = requested
+            && selected
+            && window_input.id() != Some(id)
+        {
+            window = None;
+            focused = None;
+            read.targets.clear();
+            if !matches!(window_input, WindowInput::Ambiguous) {
+                window_input = WindowInput::Unavailable { window_id: id };
+            }
+        }
         let result = json!({
             "pid": pid,
             "window": window,
             "focused": focused,
             "truncated": read.truncated,
+            "windowInput": window_input,
         });
         self.reads.push_back(read.targets);
         if !accessibility::retained_read(self.reads.len() - 1) {
@@ -418,6 +515,45 @@ fn current_window(application: &Element) -> Result<Option<Element>, native::Erro
     // An application with no primary window can still expose one concrete
     // candidate, for example a single window belonging to a background app.
     native::only_window(application)
+}
+
+fn running_application(pid: i32) -> Result<Retained<NSRunningApplication>, String> {
+    NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        .filter(|application| pid > 0 && !application.isTerminated())
+        .ok_or_else(|| format!("no running application with PID {pid}"))
+}
+
+fn exact_window(
+    application: &Element,
+    windows: &[WindowInfo],
+    pid: i32,
+    id: u32,
+) -> Result<(Option<Element>, WindowInput), String> {
+    let attributes = Attributes::new(|name| matches!(name, "position" | "size" | "title"));
+    let mut selected = None;
+    let mut status = WindowInput::Unmatched;
+    for element in native::windows(application).map_err(|error| error.to_string())? {
+        let fields = match attributes.read(&element) {
+            // DEFENSE: AXWindows can include an element closed before its attributes are read.
+            Err(error) if error.is_invalid_element() => continue,
+            result => result.map_err(|error| error.to_string())?,
+        };
+        let matched = window_id::find(windows, pid, &fields);
+        if matched.id() == Some(id) {
+            if selected.is_some() {
+                return Ok((None, WindowInput::Ambiguous));
+            }
+            selected = Some(element);
+        } else if matches!(matched, WindowInput::Ambiguous)
+            && window_id::may_match(windows, pid, id, &fields)
+        {
+            status = WindowInput::Ambiguous;
+        }
+    }
+    if matches!(status, WindowInput::Ambiguous) {
+        return Ok((None, status));
+    }
+    Ok((selected, status))
 }
 
 fn frontmost_application() -> Result<Retained<NSRunningApplication>, String> {

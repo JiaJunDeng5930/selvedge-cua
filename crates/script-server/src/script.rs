@@ -5,7 +5,9 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rmcp::model::{CallToolResult, ContentBlock};
-use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Ctx, Exception, Function, Promise};
+use rquickjs::{
+    AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Ctx, Exception, Function, Promise,
+};
 use serde_json::{Value, json};
 use tokio::{
     sync::oneshot,
@@ -14,20 +16,20 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{Desktop, Operation, Response};
+use crate::{Desktop, Operation, OperationError, Response};
 
 const RUN_DURATION: Duration = Duration::from_secs(60);
 const JS_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 const MAX_ACTIVE_CALLS: usize = 32;
 
 pub(crate) struct Output {
-    result: Result<Value, String>,
+    result: Reply,
     images: Vec<Vec<u8>>,
     observations: Vec<Value>,
 }
 
 impl Output {
-    pub(crate) fn failed(error: impl Into<String>) -> Self {
+    pub(crate) fn failed(error: impl Into<OperationError>) -> Self {
         Self {
             result: Err(error.into()),
             images: Vec::new(),
@@ -41,10 +43,16 @@ impl Output {
                 "result": result,
                 "observations": self.observations,
             })),
-            Err(error) => CallToolResult::structured_error(json!({
-                "error": error,
-                "observations": self.observations,
-            })),
+            Err(error) => {
+                let mut content = json!({
+                    "error": error.message,
+                    "observations": self.observations,
+                });
+                if let Some(code) = error.code.as_deref() {
+                    content["code"] = json!(code);
+                }
+                CallToolResult::structured_error(content)
+            }
         };
         result.content.extend(
             self.images
@@ -55,10 +63,10 @@ impl Output {
     }
 }
 
-type Reply = Result<Value, String>;
+type Reply = Result<Value, OperationError>;
 
 struct NativeCall {
-    started: Option<oneshot::Receiver<Reply>>,
+    started: Option<oneshot::Receiver<Result<Value, String>>>,
     finished: oneshot::Receiver<Reply>,
 }
 
@@ -109,7 +117,7 @@ impl<D: Desktop> Invocation<D> {
         // Desktop-changing effects follow script call order. Reads have an
         // independent schedule so the script can observe an ongoing action.
         let mut input_order = match operation {
-            Operation::ObserveScreen | Operation::ReadUi => None,
+            Operation::ObserveScreen | Operation::ReadUi | Operation::ListWindows => None,
             _ => {
                 let (done, next) = oneshot::channel();
                 Some((work.last_input.replace(next), done))
@@ -188,7 +196,7 @@ impl<D: Desktop> Invocation<D> {
         outcome
     }
 
-    fn output(&self, result: Result<Value, String>) -> Output {
+    fn output(&self, result: Reply) -> Output {
         let observations = {
             let mut work = self.work.lock().expect("native work lock");
             std::mem::take(&mut work.observations)
@@ -257,12 +265,17 @@ pub(crate) async fn execute<D: Desktop>(
         }
         result = &mut drain => result,
     };
-    result = result.and_then(|value| drained.map(|()| value));
+    result = result.and_then(|value| drained.map(|()| value).map_err(Into::into));
     if let Err(error) = invocation.desktop.finish_run(result.is_ok()).await {
         // DEFENSE: Native key-up can fail if input posting becomes unavailable.
         result = Err(match result {
-            Ok(_) => error,
-            Err(script_error) => format!("{script_error}; desktop cleanup failed: {error}"),
+            Ok(_) => error.into(),
+            Err(mut script_error) => {
+                script_error
+                    .message
+                    .push_str(&format!("; desktop cleanup failed: {error}"));
+                script_error
+            }
         });
     }
     invocation.output(result)
@@ -272,7 +285,7 @@ async fn evaluate<D: Desktop>(
     invocation: Arc<Invocation<D>>,
     code: String,
     deadline: Instant,
-) -> Result<Value, String> {
+) -> Reply {
     let runtime = AsyncRuntime::new().map_err(|error| error.to_string())?;
     runtime.set_memory_limit(JS_MEMORY_LIMIT).await;
     let cancel = invocation.cancel.clone();
@@ -286,19 +299,14 @@ async fn evaluate<D: Desktop>(
         .map_err(|error| error.to_string())?;
     context
         .async_with(async move |ctx| {
-            bind(&ctx, invocation)
-                .catch(&ctx)
-                .map_err(|error| error.to_string())?;
+            bind(&ctx, invocation).catch(&ctx).map_err(script_error)?;
             let source = format!("(async () => {{\n{code}\n}})()");
-            let promise: Promise = ctx
-                .eval(source)
-                .catch(&ctx)
-                .map_err(|error| error.to_string())?;
+            let promise: Promise = ctx.eval(source).catch(&ctx).map_err(script_error)?;
             let result = promise
                 .into_future::<rquickjs::Value>()
                 .await
                 .catch(&ctx)
-                .map_err(|error| error.to_string())?;
+                .map_err(script_error)?;
             let json = ctx
                 .json_stringify(result)
                 .catch(&ctx)
@@ -307,11 +315,22 @@ async fn evaluate<D: Desktop>(
                 .transpose()
                 .map_err(|error| error.to_string())?;
             match json {
-                Some(json) => serde_json::from_str(&json).map_err(|error| error.to_string()),
+                Some(json) => serde_json::from_str(&json).map_err(|error| error.to_string().into()),
                 None => Ok(Value::Null),
             }
         })
         .await
+}
+
+fn script_error(error: CaughtError<'_>) -> OperationError {
+    let code = match &error {
+        CaughtError::Exception(exception) => exception.as_object().get::<_, String>("code").ok(),
+        _ => None,
+    };
+    OperationError {
+        message: error.to_string(),
+        code,
+    }
 }
 
 fn bind<'js, D: Desktop>(ctx: &Ctx<'js>, invocation: Arc<Invocation<D>>) -> rquickjs::Result<()> {
@@ -319,6 +338,7 @@ fn bind<'js, D: Desktop>(ctx: &Ctx<'js>, invocation: Arc<Invocation<D>>) -> rqui
     for (name, operation) in [
         ("observeScreen", Operation::ObserveScreen),
         ("readUI", Operation::ReadUi),
+        ("listWindows", Operation::ListWindows),
         ("pointer", Operation::Pointer),
         ("keyboard", Operation::Keyboard),
         ("scroll", Operation::Scroll),
@@ -404,15 +424,25 @@ fn reject<'js>(ctx: &Ctx<'js>, error: &str) -> rquickjs::Result<Promise<'js>> {
     Ok(promise)
 }
 
-fn promise<'js>(ctx: &Ctx<'js>, reply: oneshot::Receiver<Reply>) -> rquickjs::Result<Promise<'js>> {
+fn promise<'js, E: Into<OperationError> + Send + 'static>(
+    ctx: &Ctx<'js>,
+    reply: oneshot::Receiver<Result<Value, E>>,
+) -> rquickjs::Result<Promise<'js>> {
     let context = ctx.clone();
     Promise::wrap_future(ctx, async move {
         let response = reply
             .await
-            .unwrap_or_else(|_| Err("Native call ended without a reply".into()));
+            .map_err(|_| Exception::throw_message(&context, "Native call ended without a reply"))?;
         match response {
             Ok(value) => context.json_parse(value.to_string()),
-            Err(error) => Err(Exception::throw_message(&context, &error)),
+            Err(error) => {
+                let error = error.into();
+                let exception = Exception::from_message(context.clone(), &error.message)?;
+                if let Some(code) = error.code {
+                    exception.as_object().set("code", code)?;
+                }
+                Err(exception.throw())
+            }
         }
     })
 }

@@ -22,6 +22,7 @@ mod script;
 pub enum Operation {
     ObserveScreen,
     ReadUi,
+    ListWindows,
     Pointer,
     Keyboard,
     Scroll,
@@ -33,6 +34,36 @@ pub struct Response {
     pub value: Value,
     /// Images are PNGs. Observation indices address this vector.
     pub images: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
+pub struct OperationError {
+    pub message: String,
+    pub code: Option<String>,
+}
+
+impl OperationError {
+    pub fn coded(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: Some(code.into()),
+        }
+    }
+}
+
+impl From<String> for OperationError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            code: None,
+        }
+    }
+}
+
+impl From<&str> for OperationError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
 }
 
 /// Operations return after dispatch or observation. Only screen observations
@@ -49,7 +80,7 @@ pub trait Desktop: Send + Sync + 'static {
         options: Value,
         started: Option<oneshot::Sender<Result<Value, String>>>,
         cancel: CancellationToken,
-    ) -> impl Future<Output = Result<Response, String>> + Send;
+    ) -> impl Future<Output = Result<Response, OperationError>> + Send;
 
     /// Called once after every invocation whose native work has been drained.
     fn finish_run(&self, successful: bool) -> impl Future<Output = Result<(), String>> + Send;
@@ -70,7 +101,7 @@ struct Run {
 #[tool_router(router = tools)]
 impl<D: Desktop> Server<D> {
     #[tool(
-        description = "Run async JavaScript with observeScreen, readUI, pointer, keyboard, scroll, insertText and performUIAction. Return JSON data. Screen observations attach PNG images."
+        description = "Run async JavaScript with observeScreen, listWindows, readUI, pointer, keyboard, scroll, insertText and performUIAction. Return JSON data. Screen observations attach PNG images."
     )]
     async fn run(
         &self,
@@ -109,7 +140,8 @@ impl<D: Desktop> ServerHandler for Server<D> {
             ))
             .with_instructions(
                 "Use run({code}) with an async JavaScript function body. \
-                 Start pointer input with the target windowId from readUI and keyboard input with the target pid. \
+                 Find background windows with listWindows({bundleId}), then readUI({windowId}). \
+                 Start pointer input with a ready windowId from readUI and keyboard input with the target pid. \
                  Pass the operation reference to continue held input. \
                  observeScreen(options) has started and finished promises and can also be awaited directly. \
                  The result includes observations with image offsets into the PNG attachments.",

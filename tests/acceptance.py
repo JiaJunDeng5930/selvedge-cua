@@ -8,7 +8,9 @@ import argparse
 import base64
 import json
 from pathlib import Path
+import plistlib
 import select
+import signal
 import struct
 import subprocess
 import tempfile
@@ -87,7 +89,7 @@ def protocol(client):
     assert [tool["name"] for tool in tools] == ["run"]
     result, _ = client.run(
         """
-        const methods = [observeScreen, readUI, pointer, keyboard, scroll, insertText, performUIAction];
+        const methods = [observeScreen, listWindows, readUI, pointer, keyboard, scroll, insertText, performUIAction];
         const receipts = await Promise.all([
             pointer({position: t => {throw new Error('sample at ' + t)}, durationMs: 22})
                 .then(() => null, e => e.message),
@@ -97,7 +99,7 @@ def protocol(client):
         return {methods: methods.map(f => typeof f), receipts};
         """.replace("__SELF_PID__", str(client.process.pid))
     )
-    assert result["result"]["methods"] == ["function"] * 7, result
+    assert result["result"]["methods"] == ["function"] * 8, result
     assert "sample at 0" in result["result"]["receipts"][0], result
     assert "InvalidKey" in result["result"]["receipts"][1], result
     result, _ = client.run("throw new Error('intentional failure')", expect_error=True)
@@ -105,6 +107,8 @@ def protocol(client):
     assert client.run("return 42;")[0]["result"] == 42
     result, _ = client.run('return await readUI({fields:["typo"]});', expect_error=True)
     assert "Unknown readUI field: typo" in result["error"], result
+    result, _ = client.run('return await observeScreen({maxDimension:0});', expect_error=True)
+    assert "nonzero" in result["error"].lower(), result
 
 
 def result(client, code):
@@ -276,8 +280,9 @@ def desktop(client, fixture, fixture_binary, log_path, concurrent_binary):
     }, compact
     print("desktop display and window capture passed", flush=True)
     local_screen_change(client, fixture_binary, pid, ready["pulseRegion"], events)
-    assert desktop_state() == before, "Background observation changed foreground or hardware cursor"
     region = {"region": {"x": x + 12, "y": y + 70, "width": 360, "height": 450}}
+    after = desktop_state()
+    assert after == before, ("Background observation changed foreground or hardware cursor", before, after)
     reply, content = client.run(f"""
         const screen = observeScreen({{
             target: {json.dumps(region)}, durationMs: 900, intervalMs: 45, imageBudget: 4
@@ -384,8 +389,58 @@ def desktop(client, fixture, fixture_binary, log_path, concurrent_binary):
     assert len(events("scroll")) == 5 and events("scroll")[0]["dx"] and events("scroll")[0]["dy"], events("scroll")
     kinds = [item["kind"] for image in scroll["images"] for item in image]
     assert "scroll" in kinds, kinds
-    assert desktop_state() == before, "Background run changed foreground or hardware cursor"
+    after = desktop_state()
+    assert after == before, ("Background run changed foreground or hardware cursor", before, after)
     print("desktop undo, text, AX, cancellation and scroll passed with foreground and cursor unchanged", flush=True)
+
+    fixture.send_signal(signal.SIGUSR1)
+    end = time.monotonic() + 5
+    while True:
+        secondary_events = events("secondary")
+        windows = result(client, 'return await listWindows({bundleId:"dev.selvedge.desktop-fixture"});')
+        visible = {w["windowId"] for w in windows["windows"] if w["pid"] == pid and w["onScreen"]}
+        if secondary_events and {window_id, secondary_events[0]["windowId"]} <= visible:
+            secondary_id = secondary_events[0]["windowId"]
+            break
+        assert time.monotonic() < end, windows
+        time.sleep(.1)
+    secondary = result(client, f"""
+        return await readUI({{windowId:{secondary_id}, fields:["title"]}});
+    """)
+    assert secondary["window"]["title"] == "Secondary Fixture Window", secondary
+    assert secondary["windowInput"] == {
+        "status": "ready", "windowId": secondary_id,
+    }, secondary
+    assert secondary["focused"] is None, secondary
+    missing = result(client, "return await readUI({windowId:4294967295});")
+    assert missing["window"] is None
+    assert missing["windowInput"] == {"status": "unavailable", "windowId": 4294967295}, missing
+    codes = result(client, """
+        const at = () => ({x:0,y:0});
+        const caught = options => pointer(options).catch(error => error.code);
+        return [await caught({position:at}), await caught({windowId:4294967295, position:at})];
+    """)
+    assert codes == ["windowRequired", "windowUnavailable"], codes
+    reply, _ = client.run(
+        "return await scroll({windowId:4294967295,x:0,y:0,events:[{dy:1}]});",
+        expect_error=True,
+    )
+    assert reply["code"] == "windowUnavailable", reply
+
+    def capture(options):
+        reply, content = client.run(f"return await observeScreen({json.dumps(options)});")
+        viewport = observation(reply, content)["viewport"]
+        return viewport, screenshot(content, viewport["imageIndex"])
+
+    overview_region = {"region": {"x": x + 12, "y": y + 70, "width": 360, "height": 450}}
+    native, native_size = capture({"target": overview_region})
+    overview, overview_size = capture({"target": overview_region, "maxDimension": 180})
+    assert overview["desktopRect"] == native["desktopRect"], (overview, native)
+    assert overview_size == (144, 180), overview_size
+    assert native_size[0] > overview_size[0] and native_size[1] > overview_size[1], native_size
+    after = desktop_state()
+    assert after == before, ("Window discovery changed foreground or hardware cursor", before, after)
+    print("desktop discovery, exact AX window, input error codes, and overview coordinates passed", flush=True)
 
 
 def main():
@@ -407,14 +462,23 @@ def main():
             with tempfile.TemporaryDirectory(prefix="selvedge-acceptance-") as directory:
                 root = Path(directory)
                 source = Path(__file__).with_name("DesktopFixture.swift")
-                subprocess.run(["swiftc", source, "-o", root / "fixture"], check=True)
+                contents = root / "Fixture.app" / "Contents"
+                fixture_binary = contents / "MacOS" / "fixture"
+                fixture_binary.parent.mkdir(parents=True)
+                (contents / "Info.plist").write_bytes(plistlib.dumps({
+                    "CFBundleIdentifier": "dev.selvedge.desktop-fixture",
+                    "CFBundleExecutable": "fixture",
+                    "CFBundlePackageType": "APPL",
+                    "LSUIElement": True,
+                }))
+                subprocess.run(["swiftc", source, "-o", fixture_binary], check=True)
                 with (root / "fixture.log").open("wb") as log:
                     fixture = subprocess.Popen(
-                        [root / "fixture", root / "events.json"], stdout=log, stderr=log
+                        [fixture_binary, root / "events.json"], stdout=log, stderr=log
                     )
                 try:
                     desktop(
-                        client, fixture, root / "fixture", root / "events.json",
+                        client, fixture, fixture_binary, root / "events.json",
                         binary if options.concurrent_capture else None,
                     )
                 finally:
