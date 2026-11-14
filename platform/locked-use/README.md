@@ -30,15 +30,15 @@ export OPEN_COMPUTER_USE_CODESIGN_IDENTITY='Developer ID Application: Example (T
 platform/locked-use/build.sh /absolute/path/to/new-release-output
 
 # After building the Selvedge Rust executable with cargo build --release --locked
-codesign --force --options runtime --timestamp --identifier dev.selvedge.cua-mcp \
-  --sign "$OPEN_COMPUTER_USE_CODESIGN_IDENTITY" target/release/selvedge-cua-mcp
-codesign --verify --strict target/release/selvedge-cua-mcp
+SELVEDGE_CODESIGN_IDENTITY="$OPEN_COMPUTER_USE_CODESIGN_IDENTITY" \
+  platform/macos/package-app.sh target/release/selvedge-cua-mcp \
+  'target/release/Selvedge CUA MCP.app'
 ```
 
 ## Deploy on a test Mac
 
-From the active console account, place the signed app bundle and the signed
-Selvedge binary in operator-managed locations. Deploy the signed components
+From the active console account, place both signed app bundles in
+operator-managed locations. Deploy the signed components
 from the bundle that contains this bridge. The upstream installer stages that
 same signed app and records its team and signing identifier for both Broker
 roles. If Open Computer Use Locked Use is already installed, follow the
@@ -51,7 +51,7 @@ See the [upstream deployment and recovery instructions](https://github.com/iFury
 helper='/absolute/path/to/Open Computer Use.app/Contents/MacOS/OpenComputerUse'
 "$helper" locked-use enable
 "$helper" locked-use status
-/absolute/path/to/selvedge-cua-mcp --locked-use-helper "$helper"
+'/absolute/path/to/Selvedge CUA MCP.app/Contents/MacOS/selvedge-cua-mcp' --locked-use-helper "$helper"
 ```
 
 Grant the upstream permissions called out by `locked-use status` and ensure the

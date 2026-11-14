@@ -1,6 +1,7 @@
 """Exercise the installed binary through MCP stdio.
 
 Pass --desktop to use a real AppKit fixture in an authorized desktop session.
+Pass --concurrent-capture along with --desktop to test two bundled MCP processes.
 """
 
 import argparse
@@ -204,7 +205,28 @@ def local_screen_change(client, fixture_binary, pid, region, events):
     print("desktop local change preserved three complete frames and the final viewport", flush=True)
 
 
-def desktop(client, fixture, fixture_binary, log_path):
+def concurrent_capture(client, window_id, binary):
+    request = {
+        "name": "run",
+        "arguments": {
+            "code": f"""return await observeScreen({{
+                target: {{windowId: {window_id}}}, durationMs: 650, intervalMs: 125
+            }});""",
+        },
+    }
+    # The first client has already captured a window and display. Both clients
+    # must still receive frames when a second process registers with macOS.
+    with Client(binary) as second:
+        requests = [(c, c.start("tools/call", request)) for c in (client, second)]
+        for c, request_id in requests:
+            response = c.wait(request_id)
+            assert not response.get("isError"), response["content"][0]
+            manifest = observation(response["structuredContent"], response["content"])
+            assert sum(frame["sampleCount"] for frame in manifest["frames"]) >= 2, manifest
+    print("concurrent window capture passed for two MCP processes", flush=True)
+
+
+def desktop(client, fixture, fixture_binary, log_path, concurrent_binary):
     def events(kind):
         if not log_path.exists():
             return []
@@ -227,6 +249,8 @@ def desktop(client, fixture, fixture_binary, log_path):
     for target in ({"target": {"windowId": window_id}}, {}):
         reply, content = client.run(f"return await observeScreen({json.dumps(target)});")
         assert len(observation(reply, content)["frames"]) == 1
+    if concurrent_binary:
+        concurrent_capture(client, window_id, concurrent_binary)
     end = time.monotonic() + 5
     while True:
         ui = result(client, f"return await readUI({{pid:{pid},maxDepth:1,maxNodes:20}});")
@@ -368,8 +392,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--desktop", action="store_true")
+    parser.add_argument("--concurrent-capture", action="store_true")
     options = parser.parse_args()
-    with Client(options.binary.resolve()) as client:
+    binary = options.binary.resolve()
+    if options.concurrent_capture and not (
+        options.desktop and binary.parent.name == "MacOS"
+        and binary.parents[1].name == "Contents" and binary.parents[2].suffix == ".app"
+    ):
+        parser.error("--concurrent-capture requires --desktop and an executable in an app bundle")
+    with Client(binary) as client:
         protocol(client)
         print("MCP protocol passed")
         if options.desktop:
@@ -382,7 +413,10 @@ def main():
                         [root / "fixture", root / "events.json"], stdout=log, stderr=log
                     )
                 try:
-                    desktop(client, fixture, root / "fixture", root / "events.json")
+                    desktop(
+                        client, fixture, root / "fixture", root / "events.json",
+                        binary if options.concurrent_capture else None,
+                    )
                 finally:
                     fixture.terminate()
                     fixture.wait(timeout=5)

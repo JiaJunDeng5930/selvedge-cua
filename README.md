@@ -15,20 +15,30 @@ run `make build` in the compiler checkout. The Cargo build expects a sibling
 ```sh
 export ROCQ2RUST_PLUGIN=/absolute/path/to/rocq2rust/_build/rocq2rust-plugin
 cargo build --release --locked
+platform/macos/package-app.sh target/release/selvedge-cua-mcp \
+  'target/release/Selvedge CUA MCP.app'
 ```
 
-Configure the MCP client to launch `target/release/selvedge-cua-mcp` by
-absolute path with stdio transport. The running binary uses macOS 14 or
-later and the host application's Screen Recording and Accessibility
-permissions. JavaScript, Rocq, and extraction are built into the executable
-or used during the build. There are no language runtimes to install alongside
-the binary.
+Configure the MCP client to launch the absolute executable path printed by
+the packaging script over stdio:
 
-If a build at the configured path repeatedly times out in ScreenCaptureKit
-while an identical copy works on the same unlocked desktop, install the
-verified build at a fresh path and point the MCP client at that executable.
-Reconnect the client so it launches the replacement. An existing MCP
-process continues using its original executable until it exits.
+```toml
+[mcp_servers.selvedge-cua-mcp]
+command = "/absolute/path/to/target/release/Selvedge CUA MCP.app/Contents/MacOS/selvedge-cua-mcp"
+```
+
+Each Codex chat can start a separate MCP process. Launch the executable
+inside `Contents/MacOS` so that ScreenCaptureKit can serve multiple processes
+from the same install. Concurrent processes launched from the same bare
+executable can cause screenshot timeouts. Reconnect the MCP client after
+changing its configuration or replacing the bundle.
+
+The package is ad hoc signed for local use by default. Set
+`SELVEDGE_CODESIGN_IDENTITY` to an existing Developer ID Application identity
+to sign with hardened runtime for [Locked Use](platform/locked-use/README.md).
+Selvedge uses macOS 14 or later and the host application's Screen Recording
+and Accessibility permissions. JavaScript is embedded, and Rocq is only
+needed at build time.
 
 ## Write a script
 
@@ -148,7 +158,9 @@ cargo clippy --workspace --locked -- -D warnings
 cargo build --locked
 python3 tests/acceptance.py target/debug/selvedge-cua-mcp
 python3 tests/locked_use_acceptance.py target/debug/selvedge-cua-mcp
-python3 tests/acceptance.py target/debug/selvedge-cua-mcp --desktop
+python3 tests/acceptance.py \
+  'target/release/Selvedge CUA MCP.app/Contents/MacOS/selvedge-cua-mcp' \
+  --desktop --concurrent-capture
 ```
 
 The desktop acceptance opens an AppKit fixture in the active, unlocked
@@ -157,6 +169,8 @@ a continuous drag with one undo, text insertion, accessibility actions,
 cancellation and scrolling. The fixture runs in the background and the test
 compares the foreground application and hardware cursor before and after
 the scripted input. Run it while the pointer is stationary for that comparison.
+The concurrent capture check overlaps two window observations from the same
+bundled executable, with one MCP process per client.
 
 Mouse and scroll dispatch require macOS window-local event routing. AppKit
 applications can receive it in the background. The routing capability is
