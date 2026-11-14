@@ -6,7 +6,7 @@ body in embedded QuickJS and returns JSON and any captured PNGs.
 
 ## Plaster sphere sketch comparison
 
-Both runs used GPT-6.1-Sol with medium reasoning effort.
+Both runs were routed to GPT-6.2-Sol with medium reasoning effort.
 
 | | Selvedge | Codex Computer Use |
 | --- | --- | --- |
