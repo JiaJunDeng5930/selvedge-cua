@@ -25,10 +25,10 @@ or used during the build. There are no language runtimes to install alongside
 the binary.
 
 If a build at the configured path repeatedly times out in ScreenCaptureKit
-while an identical copy works on the same unlocked desktop, copy the verified
-build to a new file beside the configured executable and rename it into place.
-Reconnect the MCP client so it launches the replacement. An existing MCP
-process continues using its original executable after the file is replaced.
+while an identical copy works on the same unlocked desktop, install the
+verified build at a fresh path and point the MCP client at that executable.
+Reconnect the client so it launches the replacement. An existing MCP
+process continues using its original executable until it exits.
 
 ## Write a script
 
