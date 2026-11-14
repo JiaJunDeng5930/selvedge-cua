@@ -4,6 +4,19 @@ Selvedge runs computer-use scripts against the macOS desktop. It exposes one
 MCP tool, `run({code})`, over stdio. Each call runs an async JavaScript function
 body in embedded QuickJS and returns JSON and any captured PNGs.
 
+## Plaster sphere sketch comparison
+
+Both runs used GPT-6.1-Sol with medium reasoning effort.
+
+| | Selvedge | Codex Computer Use |
+| --- | --- | --- |
+| Exported sketch | ![Selvedge plaster sphere sketch](docs/images/plaster-sketch-selvedge.png) | ![Codex Computer Use plaster sphere sketch](docs/images/plaster-sketch-codex.png) |
+| End-to-end time | 4 min 34.5 s | 7 min 8.8 s |
+| Computer Use call time (sum) | 16.9 s | 229.7 s |
+| Total tokens (including cached input) | 1,337,595 | 2,258,485 |
+| Uncached input tokens | 53,268 | 111,812 |
+| Output tokens (including reasoning) | 6,375 | 5,105 |
+
 ## Build and run
 
 Build on macOS with Xcode Command Line Tools, Rust, and the Rocq 9.2 toolchain
