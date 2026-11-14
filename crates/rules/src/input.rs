@@ -51,6 +51,13 @@ impl State {
         }
     }
 
+    /// Withdraw a reference whose desktop authorization has ended.
+    /// The generation remains reserved, even if native release failed.
+    pub fn invalidate_held(&mut self) {
+        self.held = List::Nil;
+        self.destination = None;
+    }
+
     pub fn window(&self) -> Option<u32> {
         match &self.destination {
             Some(input_rules::Destination::Destination(_, Option_1::Some(window))) => {

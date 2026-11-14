@@ -2,10 +2,12 @@
 
 mod desktop;
 mod input;
+mod locked_use;
 
-use std::{sync::mpsc, thread, time::Duration};
+use std::{io, path::PathBuf, sync::mpsc, thread, time::Duration};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let helper = locked_use_helper()?;
     let (finish, finished) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
         let result = tokio::runtime::Builder::new_multi_thread()
@@ -13,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .build()
             .map_err(Into::into)
             .and_then(|runtime| {
-                runtime.block_on(selvedge_script_server::serve(desktop::Desktop::new()))
+                runtime.block_on(selvedge_script_server::serve(desktop::Desktop::new(helper)))
             });
         let _ = finish.send(result);
     });
@@ -31,4 +33,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
     }
+}
+
+fn locked_use_helper() -> io::Result<Option<PathBuf>> {
+    let mut args = std::env::args_os().skip(1);
+    let Some(option) = args.next() else {
+        return Ok(None);
+    };
+    if option == "--locked-use-helper"
+        && let Some(path) = args.next().map(PathBuf::from)
+        && path.is_absolute()
+        && args.next().is_none()
+    {
+        return Ok(Some(path));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "Usage: selvedge-cua-mcp [--locked-use-helper /absolute/path]",
+    ))
 }

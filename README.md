@@ -94,6 +94,30 @@ among the available row and column layouts. Actual token accounting depends
 on the MCP client and model. The observation rejects if required evidence
 cannot fit within the image budget at that detail.
 
+## Locked Use on macOS
+
+A configured Locked Use helper can open a protected session for a script that
+starts while the current console desktop is locked. Selvedge operates on the
+same desktop and applications. The helper uses Open Computer Use's signed
+macOS authorization component and display guardian. Once the platform
+components have been installed and approved, individual scripts require no
+unlock prompt.
+
+Set the MCP server's arguments to
+`--locked-use-helper /absolute/path/to/the/signed/helper`. The helper path is
+set by the operator who starts the MCP server. Scripts use the same `run`
+tool and seven JavaScript functions. A script that does no desktop work does
+not start a helper. See the [macOS build and deployment instructions](platform/locked-use/README.md).
+
+While a protected session is active, `observeScreen` requires
+`target: {windowId}`. Use `readUI({pid})` to find the application window.
+The window-only filter captures the requested application window separately
+from the physical display. Input may stay held between calls inside a script.
+The server releases its held input before ending a helper-managed script.
+It reports successful protected completion after the helper confirms the
+original session has relocked. Local takeover and guard failure revoke the
+session.
+
 ## Source and validation
 
 [`Requirement.v`](crates/rules/formal/Requirement.v) derives the desktop
@@ -108,6 +132,7 @@ and macOS responses are external inputs to those rules.
 cargo clippy --workspace --locked -- -D warnings
 cargo build --locked
 python3 tests/acceptance.py target/debug/selvedge-cua-mcp
+python3 tests/locked_use_acceptance.py target/debug/selvedge-cua-mcp
 python3 tests/acceptance.py target/debug/selvedge-cua-mcp --desktop
 ```
 

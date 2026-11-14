@@ -262,7 +262,7 @@ pub(crate) async fn execute<D: Desktop>(
         // DEFENSE: Native key-up can fail if input posting becomes unavailable.
         result = Err(match result {
             Ok(_) => error,
-            Err(script_error) => format!("{script_error}; input cleanup failed: {error}"),
+            Err(script_error) => format!("{script_error}; desktop cleanup failed: {error}"),
         });
     }
     invocation.output(result)

@@ -1,6 +1,7 @@
 //! Input dispatch is serialized across scripts, while observation may read a
 //! snapshot between events. The mutex pairs each native send with its Rocq
 //! acknowledgement. It is released during timed waits.
+use crate::locked_use::DesktopPermission;
 use selvedge_macos_ax::{self as ax, InputProcess, InputWindow};
 use selvedge_macos_input::{self as native, Point, WindowRoute};
 use selvedge_rules::input::{Change, Held, State};
@@ -25,6 +26,7 @@ pub struct Input {
 #[derive(Default)]
 struct DispatchState {
     rules: State,
+    requires_permission: bool,
     running: bool,
     dispatch_epoch: u64,
     used_in_run: bool,
@@ -142,6 +144,12 @@ struct ScrollEvent {
 }
 
 impl Input {
+    pub fn new(requires_permission: bool) -> Self {
+        let input = Self::default();
+        input.state().requires_permission = requires_permission;
+        input
+    }
+
     pub fn snapshot(&self) -> Value {
         self.state().snapshot()
     }
@@ -156,6 +164,7 @@ impl Input {
         plan: Pointer,
         clock: Instant,
         cancel: CancellationToken,
+        permission: &DesktopPermission,
     ) -> Result<Value, String> {
         let _dispatch = self.dispatch.lock().await;
         if plan.samples.len() > MAX_STEPS {
@@ -217,6 +226,7 @@ impl Input {
             steps,
             clock,
             cancel,
+            permission,
         )
         .await
     }
@@ -226,6 +236,7 @@ impl Input {
         plan: Keyboard,
         clock: Instant,
         cancel: CancellationToken,
+        permission: &DesktopPermission,
     ) -> Result<Value, String> {
         let _dispatch = self.dispatch.lock().await;
         if plan.events.len() > MAX_STEPS {
@@ -262,6 +273,7 @@ impl Input {
             steps,
             clock,
             cancel,
+            permission,
         )
         .await
     }
@@ -271,6 +283,7 @@ impl Input {
         plan: Scroll,
         clock: Instant,
         cancel: CancellationToken,
+        permission: &DesktopPermission,
     ) -> Result<Value, String> {
         let _dispatch = self.dispatch.lock().await;
         if plan.events.is_empty() || plan.events.len() > MAX_STEPS {
@@ -304,6 +317,7 @@ impl Input {
             steps,
             clock,
             cancel,
+            permission,
         )
         .await
     }
@@ -347,6 +361,7 @@ impl Input {
         steps: Vec<Step>,
         clock: Instant,
         cancel: CancellationToken,
+        permission: &DesktopPermission,
     ) -> Result<Value, String> {
         if cancel.is_cancelled() {
             return Err("Input was cancelled before dispatch".into());
@@ -400,6 +415,14 @@ impl Input {
                 failure = Some("Input was cancelled during dispatch".into());
                 break;
             }
+            if let Err(error) = permission.check().await {
+                failure = Some(error);
+                break;
+            }
+            if cancel.is_cancelled() {
+                failure = Some("Input was cancelled during dispatch".into());
+                break;
+            }
             match self.state().send(step.event) {
                 Ok(()) => events.push(json!({
                     "scheduledMs": step.offset.as_secs_f64() * 1000.0,
@@ -411,11 +434,13 @@ impl Input {
                 }
             }
         }
-        let mut state = self.state();
         if cancel.is_cancelled() && failure.is_none() {
             failure = Some("Input was cancelled during dispatch".into());
         }
-        let (releases, cleanup) = state.release(continuation.hold, failure.is_some(), clock);
+        let (releases, cleanup) = self
+            .release(continuation.hold, failure.is_some(), clock, permission)
+            .await;
+        let mut state = self.state();
         state.running = false;
         let mut result = state.snapshot();
         result["startedAtMs"] = json!(started_at.duration_since(clock).as_secs_f64() * 1000.0);
@@ -440,13 +465,52 @@ impl Input {
         result
     }
 
-    pub async fn finish_run(&self, successful: bool, clock: Instant) -> Result<(), String> {
+    pub async fn finish_run(
+        &self,
+        successful: bool,
+        clock: Instant,
+        permission: &DesktopPermission,
+    ) -> Result<(), String> {
         let _dispatch = self.dispatch.lock().await;
-        let mut state = self.state();
-        if std::mem::take(&mut state.used_in_run) && !successful {
-            return state.release(false, true, clock).1;
+        let used = std::mem::take(&mut self.state().used_in_run);
+        if permission.managed() || (used && !successful) {
+            let (_, cleanup) = self.release(false, true, clock, permission).await;
+            if permission.managed() {
+                self.state().rules.invalidate_held();
+            }
+            return cleanup;
         }
         Ok(())
+    }
+
+    async fn release(
+        &self,
+        hold: bool,
+        failed: bool,
+        clock: Instant,
+        permission: &DesktopPermission,
+    ) -> (Vec<Value>, Result<(), String>) {
+        let controls = self.state().rules.releases(hold, failed);
+        let mut receipts = Vec::new();
+        let mut errors = Vec::new();
+        for held in controls {
+            if let Err(error) = permission.check().await {
+                errors.push(error);
+                break;
+            }
+            match self.state().release_control(held, clock) {
+                Ok(receipt) => receipts.push(receipt),
+                // DEFENSE: An application's target or event route can expire
+                // after its original key-down or mouse-down succeeded.
+                Err(error) => errors.push(error),
+            }
+        }
+        let result = if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        };
+        (receipts, result)
     }
 
     fn state(&self) -> MutexGuard<'_, DispatchState> {
@@ -456,8 +520,14 @@ impl Input {
 
 impl Drop for Input {
     fn drop(&mut self) {
-        if let Err(error) = self.state().release(false, true, Instant::now()).1 {
-            eprintln!("Input cleanup on shutdown failed: {error}");
+        let mut state = self.state();
+        if state.requires_permission {
+            return;
+        }
+        for held in state.rules.releases(false, true) {
+            if let Err(error) = state.release_control(held, Instant::now()) {
+                eprintln!("Input cleanup on shutdown failed: {error}");
+            }
         }
     }
 }
@@ -482,34 +552,15 @@ impl DispatchState {
         })
     }
 
-    fn release(
-        &mut self,
-        hold: bool,
-        failed: bool,
-        clock: Instant,
-    ) -> (Vec<Value>, Result<(), String>) {
-        let mut receipts = Vec::new();
-        let mut errors = Vec::new();
-        for held in self.rules.releases(hold, failed) {
-            match self.send(Event::Release(held)) {
-                Ok(()) => receipts.push(json!({
-                    "control": match held {
-                        Held::Mouse(button) => json!({"button":button}),
-                        Held::Key {code,pid} => json!({"key":key_name(code),"pid":pid}),
-                    },
-                    "sentAtMs": clock.elapsed().as_secs_f64() * 1000.0
-                })),
-                // DEFENSE: A held control's target may exit or posting
-                // permission may be revoked after the initial event.
-                Err(error) => errors.push(error),
-            }
-        }
-        let result = if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        };
-        (receipts, result)
+    fn release_control(&mut self, held: Held, clock: Instant) -> Result<Value, String> {
+        self.send(Event::Release(held))?;
+        Ok(json!({
+            "control": match held {
+                Held::Mouse(button) => json!({"button":button}),
+                Held::Key {code,pid} => json!({"key":key_name(code),"pid":pid}),
+            },
+            "sentAtMs": clock.elapsed().as_secs_f64() * 1000.0
+        }))
     }
 
     fn send(&mut self, event: Event) -> Result<(), String> {

@@ -1,0 +1,58 @@
+diff --git a/apps/OpenComputerUse/Sources/OpenComputerUse/LockedUseConnection.swift b/apps/OpenComputerUse/Sources/OpenComputerUse/LockedUseConnection.swift
+index 042828d..0e6bb95 100644
+--- a/apps/OpenComputerUse/Sources/OpenComputerUse/LockedUseConnection.swift
++++ b/apps/OpenComputerUse/Sources/OpenComputerUse/LockedUseConnection.swift
+@@ -54,0 +55,4 @@ final class LockedUseConnection: @unchecked Sendable {
++        return try withInFlightAction(requiresLease: false, body)
++    }
++
++    func withInFlightAction<T>(requiresLease: Bool, _ body: () throws -> T) throws -> T {
+@@ -56 +60 @@ final class LockedUseConnection: @unchecked Sendable {
+-        guard !stopped && !clientDisconnected else { mutex.unlock(); throw ComputerUseError.stateUnavailable("Locked Use stopped. Unlock the Mac normally before starting another session.") }
++        guard !stopped && !clientDisconnected && (!requiresLease || lease != nil) else { mutex.unlock(); throw ComputerUseError.stateUnavailable("Locked Use stopped. Unlock the Mac normally before starting another session.") }
+@@ -148 +152 @@ final class LockedUseConnection: @unchecked Sendable {
+-    private func validateAction() throws {
++    func validateAction() throws {
+@@ -223 +227,2 @@ final class LockedUseConnection: @unchecked Sendable {
+-    func end(disconnecting: Bool = false) {
++    @discardableResult
++    func end(disconnecting: Bool = false) -> LockedUseStateMachine.StopReason? {
+@@ -230,4 +235,5 @@ final class LockedUseConnection: @unchecked Sendable {
+-        if let connection, let lease {
+-            if let reply = try? connection.request(.init(operation: .end, leaseID: lease, stopReason: disconnecting ? .disconnected : .turnEnded)) { receive(reply) }
+-            if drain { acknowledgeDrain() }
+-        }
++        guard let connection, let lease else { return nil }
++        let reply = try? connection.request(.init(operation: .end, leaseID: lease, stopReason: disconnecting ? .disconnected : .turnEnded))
++        if let reply { receive(reply) }
++        if drain { acknowledgeDrain() }
++        return reply?.stopReason
+diff --git a/apps/OpenComputerUse/Sources/OpenComputerUse/OpenComputerUseMain.swift b/apps/OpenComputerUse/Sources/OpenComputerUse/OpenComputerUseMain.swift
+index 7c4ce10..82f79b5 100644
+--- a/apps/OpenComputerUse/Sources/OpenComputerUse/OpenComputerUseMain.swift
++++ b/apps/OpenComputerUse/Sources/OpenComputerUse/OpenComputerUseMain.swift
+@@ -28,0 +29,5 @@ enum OpenComputerUseMain {
++        if arguments == ["--selvedge-locked-use-bridge"] {
++            try SelvedgeLockedUseBridge.run()
++            return
++        }
++
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/LockedUseBrokerCoordinator.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/LockedUseBrokerCoordinator.swift
+index ec7e8ba..d3a05cf 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/LockedUseBrokerCoordinator.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/LockedUseBrokerCoordinator.swift
+@@ -414 +414,2 @@ public struct LockedUseBrokerCoordinator: Sendable {
+-            validationConfirmation: isGuardian(context))
++            validationConfirmation: isGuardian(context),
++            stopReason: message.operation == .end && isOwner(context) ? machine.stopReason : nil)
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/LockedUseIPC.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/LockedUseIPC.swift
+index 2eaaeed..0d51f1a 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/LockedUseIPC.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/LockedUseIPC.swift
+@@ -51,0 +52 @@ public struct LockedUseIPCReply: Codable, Sendable {
++    public let stopReason: LockedUseStateMachine.StopReason?
+@@ -54 +55 @@ public struct LockedUseIPCReply: Codable, Sendable {
+-                leaseID: UUID? = nil, token: Data? = nil, effects: [String] = [], detail: String? = nil, guardsReleased: Bool? = nil, recoveryProbePrepared: Bool? = nil, startupDeadline: TimeInterval? = nil, validationConfirmation: Bool? = nil) {
++                leaseID: UUID? = nil, token: Data? = nil, effects: [String] = [], detail: String? = nil, guardsReleased: Bool? = nil, recoveryProbePrepared: Bool? = nil, startupDeadline: TimeInterval? = nil, validationConfirmation: Bool? = nil, stopReason: LockedUseStateMachine.StopReason? = nil) {
+@@ -60,0 +62 @@ public struct LockedUseIPCReply: Codable, Sendable {
++        self.stopReason = stopReason

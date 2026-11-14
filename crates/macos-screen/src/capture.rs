@@ -29,6 +29,10 @@ struct Region {
 }
 
 impl CaptureTarget {
+    pub fn is_window(self) -> bool {
+        matches!(self, Self::Window(_))
+    }
+
     pub fn from_options(options: &Value) -> Result<Self, String> {
         let options = options
             .as_object()

@@ -31,3 +31,7 @@ Print Assumptions spontaneous_effect_refutes_background.
 
 Print Assumptions first_destination.
 Print Assumptions continuation_preserves_destination.
+
+Require Import LockedUseRequirement.
+Print Assumptions confirmation_matches_contract.
+Print Assumptions successful_reply_follows_relock_and_all_effects.
