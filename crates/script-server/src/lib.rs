@@ -31,6 +31,8 @@ pub enum Operation {
     ListApps,
     LaunchApp,
     ReadMenuBar,
+    SelectText,
+    Paste,
 }
 
 pub struct Response {

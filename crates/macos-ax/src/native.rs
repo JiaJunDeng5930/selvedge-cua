@@ -6,12 +6,13 @@ use objc2_application_services::{
     AXCopyMultipleAttributeOptions, AXError, AXIsProcessTrusted, AXUIElement, AXValue, AXValueType,
 };
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGSize, Type,
+    CFArray, CFBoolean, CFNumber, CFRange, CFRetained, CFString, CFType, CGPoint, CGSize, Type,
 };
 use serde_json::{Value, json};
 
 pub type Element = CFRetained<AXUIElement>;
 pub const SELECTED_TEXT: &str = "AXSelectedText";
+pub const SELECTED_TEXT_RANGE: &str = "AXSelectedTextRange";
 
 #[derive(Debug)]
 pub enum Error {
@@ -154,6 +155,10 @@ pub fn enabled(element: &AXUIElement) -> Result<Option<bool>, Error> {
     Ok(attribute(element, "AXEnabled")?.and_then(|value| boolean(&value)))
 }
 
+pub fn text_value(element: &AXUIElement) -> Result<Option<String>, Error> {
+    Ok(attribute(element, "AXValue")?.and_then(|value| string(&value)))
+}
+
 pub fn settable(element: &AXUIElement, name: &str) -> Result<bool, Error> {
     let name = CFString::from_str(name);
     let mut value = 0;
@@ -237,6 +242,17 @@ pub fn replace_selected_text(element: &AXUIElement, text: &CFString) -> Result<(
     // SAFETY: The element and text remain live for this call. The application
     // handles the selection replacement through the specified element.
     check(unsafe { element.set_attribute_value(&CFString::from_str(SELECTED_TEXT), text.as_ref()) })
+}
+
+pub fn set_selected_text_range(element: &AXUIElement, range: CFRange) -> Result<(), Error> {
+    // SAFETY: The pointer refers to a CFRange, the layout identified by AXValueType::CFRange.
+    let value = unsafe { AXValue::new(AXValueType::CFRange, NonNull::from(&range).cast()) }.ok_or(
+        Error::UnexpectedResponse("AXValueCreate for AXSelectedTextRange"),
+    )?;
+    // SAFETY: The element, name and AXValue remain live throughout the call.
+    check(unsafe {
+        element.set_attribute_value(&CFString::from_str(SELECTED_TEXT_RANGE), value.as_ref())
+    })
 }
 
 type Field = (&'static str, &'static str, fn(&CFType) -> Option<Value>);

@@ -373,6 +373,8 @@ fn bind<'js, D: Desktop>(ctx: &Ctx<'js>, invocation: Arc<Invocation<D>>) -> rqui
         ("listApps", Operation::ListApps),
         ("launchApp", Operation::LaunchApp),
         ("readMenuBar", Operation::ReadMenuBar),
+        ("selectText", Operation::SelectText),
+        ("paste", Operation::Paste),
     ] {
         let function = binding(ctx, Arc::clone(&invocation), operation)?;
         desktop.set(name, function.with_name(name)?)?;

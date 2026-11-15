@@ -9,6 +9,7 @@
 
 mod menu_bar;
 mod native;
+mod text_selection;
 mod window_id;
 
 use std::collections::{HashMap, VecDeque};
@@ -25,6 +26,7 @@ use serde_json::{Value, json};
 
 pub use menu_bar::read_menu_bar;
 use native::{Attributes, Element};
+pub use text_selection::select_text;
 pub use window_id::{InputProcess, InputWindow, InputWindowError, input_process, input_window};
 use window_id::{WindowInfo, WindowInput};
 
@@ -138,38 +140,32 @@ pub fn insert_text(
     let target = Target::parse(&options.target)?;
     submit(move |accessibility| {
         let retained = accessibility.target(target)?;
-        let pid = retained.application.processIdentifier();
         let element = &retained.element;
-        let role = native::role(element).map_err(|error| error.to_string())?;
-        let text_role = matches!(
-            role.as_deref(),
-            Some("AXTextField" | "AXTextArea" | "AXComboBox")
-        );
-        let selection_writable =
-            native::settable(element, native::SELECTED_TEXT).map_err(|error| error.to_string())?;
-        let writable = selection_writable
-            || native::settable(element, "AXValue").map_err(|error| error.to_string())?;
-        let selected_text = selection_writable.then(|| CFString::from_str(&options.text));
-        let enabled = native::enabled(element).map_err(|error| error.to_string())?;
-        let application = native::application(pid);
-        let focused = native::element_attribute(&application, "AXFocusedUIElement")
-            .map_err(|error| error.to_string())?;
-        accessibility::authorize_background_insertion(
-            text_role,
-            writable,
-            enabled == Some(false),
-            focused.as_deref() == Some(&**element),
-        )?;
+        let (pid, selection_writable) = retained.focused_editor()?;
         let delivery = if options.text.is_empty() {
             TextDelivery::NoOp
-        } else if let Some(text) = selected_text {
-            native::replace_selected_text(element, &text).map_err(|error| error.to_string())?;
+        } else if selection_writable {
+            native::replace_selected_text(element, &CFString::from_str(&options.text))
+                .map_err(|error| error.to_string())?;
             TextDelivery::AccessibilitySelection
         } else {
             send(pid, &options.text)?;
             TextDelivery::FocusedProcess
         };
         Ok((pid, delivery))
+    })
+}
+
+/// Runs a process-directed paste shortcut immediately after checking the live editor.
+pub fn paste_into_editor(
+    target: String,
+    send: impl FnOnce(i32) -> Result<(), String> + Send + 'static,
+) -> Result<i32, String> {
+    let target = Target::parse(&target)?;
+    submit(move |accessibility| {
+        let (pid, _) = accessibility.target(target)?.focused_editor()?;
+        send(pid)?;
+        Ok(pid)
     })
 }
 
@@ -358,6 +354,32 @@ struct RetainedTarget {
     // reused after app termination does not validate a stale target.
     application: Retained<NSRunningApplication>,
     element: Element,
+}
+
+impl RetainedTarget {
+    fn focused_editor(&self) -> Result<(i32, bool), String> {
+        let pid = self.application.processIdentifier();
+        let element = &self.element;
+        let role = native::role(element).map_err(|error| error.to_string())?;
+        let text_role = matches!(
+            role.as_deref(),
+            Some("AXTextField" | "AXTextArea" | "AXComboBox")
+        );
+        let selection_writable =
+            native::settable(element, native::SELECTED_TEXT).map_err(|error| error.to_string())?;
+        let writable = selection_writable
+            || native::settable(element, "AXValue").map_err(|error| error.to_string())?;
+        let enabled = native::enabled(element).map_err(|error| error.to_string())?;
+        let focused = native::element_attribute(&native::application(pid), "AXFocusedUIElement")
+            .map_err(|error| error.to_string())?;
+        accessibility::authorize_background_insertion(
+            text_role,
+            writable,
+            enabled == Some(false),
+            focused.as_deref() == Some(&**element),
+        )?;
+        Ok((pid, selection_writable))
+    }
 }
 
 struct Accessibility {

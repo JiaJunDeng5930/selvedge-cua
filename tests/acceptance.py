@@ -100,7 +100,7 @@ def protocol(client):
         """.replace("__SELF_PID__", str(client.process.pid))
     )
     assert result["result"]["methods"] == ["function"] * 8, result
-    assert result["result"]["desktop"] == ["launchApp", "listApps", "readMenuBar"], result
+    assert result["result"]["desktop"] == ["launchApp", "listApps", "paste", "readMenuBar", "selectText"], result
     assert "sample at 0" in result["result"]["receipts"][0], result
     assert "InvalidKey" in result["result"]["receipts"][1], result
     result, _ = client.run("throw new Error('intentional failure')", expect_error=True)
@@ -346,6 +346,23 @@ def desktop(client, fixture, fixture_binary, log_path, concurrent_binary):
     """)
     time.sleep(.15)
     assert events("text")[-1]["value"] == "Hello 世界🙂", log_path.read_text()
+
+    paste = result(client, f"""
+        const {{focused: {{target}}}} = await readUI({{pid:{pid}}});
+        const selection = await desktop.selectText({{target,text:"世界🙂",prefix:"Hello "}});
+        const paste = await desktop.paste({{target,text:"background"}});
+        return {{selection: selection.range,paste}};
+    """)
+    assert paste == {"selection": {"location": 6, "length": 4}, "paste": {"pid": pid, "clipboardRestored": True}}, paste
+    assert events("text")[-1]["value"] == "Hello background", (events("paste"), events("text"))
+    rich_paste = result(client, f"""
+        const {{focused: {{target}}}} = await readUI({{pid:{pid}}});
+        await desktop.selectText({{target,text:"background"}});
+        return await desktop.paste({{target,format:"html",text:"<strong>rich</strong>",plainText:"rich"}});
+    """)
+    assert rich_paste == {"pid": pid, "clipboardRestored": True}, rich_paste
+    assert events("paste")[-1]["html"] and events("text")[-1]["value"] == "Hello rich"
+    assert desktop_state() == before, "Text selection or paste changed foreground or hardware cursor"
 
     value = result(client, f"""
         const read = () => readUI({{pid:{pid}}});

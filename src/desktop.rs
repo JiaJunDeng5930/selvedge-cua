@@ -238,6 +238,25 @@ impl selvedge_script_server::Desktop for Desktop {
                 })
                 .await?
             }
+            Operation::SelectText | Operation::Paste => {
+                self.input
+                    .exclusive(async {
+                        permission.check().await?;
+                        blocking(move || {
+                            if cancel.is_cancelled() {
+                                return Err(
+                                    "Desktop text operation was cancelled before dispatch".into()
+                                );
+                            }
+                            if name == Operation::SelectText {
+                                return selvedge_macos_ax::select_text(&options);
+                            }
+                            paste_into_editor(options, cancel)
+                        })
+                        .await
+                    })
+                    .await?
+            }
             Operation::Pointer => {
                 self.input
                     .pointer(options_as(options)?, self.clock, cancel, &permission)
@@ -314,6 +333,49 @@ impl selvedge_script_server::Desktop for Desktop {
             (Err(input), Err(relock)) => Err(format!("{input}; {relock}")),
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PasteOptions {
+    target: String,
+    text: String,
+    #[serde(default)]
+    format: PasteFormat,
+    plain_text: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum PasteFormat {
+    #[default]
+    Text,
+    Html,
+}
+
+fn paste_into_editor(options: Value, cancel: CancellationToken) -> Result<Value, String> {
+    use selvedge_macos_desktop::PasteContent;
+    let PasteOptions {
+        target,
+        text,
+        format,
+        plain_text,
+    } = options_as(options)?;
+    let content = match format {
+        PasteFormat::Text if plain_text.is_none() => PasteContent::Text(text),
+        PasteFormat::Text => return Err("desktop.paste plainText requires format html".into()),
+        PasteFormat::Html => PasteContent::Html { text, plain_text },
+    };
+    let (pid, restored) = selvedge_macos_desktop::paste(content, move || {
+        selvedge_macos_ax::paste_into_editor(target, move |pid| {
+            if cancel.is_cancelled() {
+                return Err("Paste was cancelled before dispatch".into());
+            }
+            selvedge_macos_input::keyboard(pid, "KeyV", true, &["MetaLeft"])?;
+            selvedge_macos_input::keyboard(pid, "KeyV", false, &["MetaLeft"])
+        })
+    })?;
+    Ok(json!({"pid": pid, "clipboardRestored": restored}))
 }
 
 #[derive(Deserialize)]

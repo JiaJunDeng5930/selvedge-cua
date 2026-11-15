@@ -171,6 +171,9 @@ final class Delegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         let undo = NSMenuItem(title: "Undo Stroke", action: #selector(Drawing.undo(_:)), keyEquivalent: "z")
         undo.target = drawing
         edit.addItem(undo)
+        let paste = NSMenuItem(title: "Paste", action: #selector(pasteInEditor(_:)), keyEquivalent: "v")
+        paste.target = self
+        edit.addItem(paste)
         let main = NSMenu()
         let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
         editItem.submenu = edit
@@ -190,6 +193,11 @@ final class Delegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
     func controlTextDidChange(_ notification: Notification) {
         record("text", ["value": field.stringValue])
+    }
+    @objc func pasteInEditor(_ sender: Any?) {
+        let html = NSPasteboard.general.types?.contains(.html) == true
+        field.currentEditor()?.paste(sender)
+        record("paste", ["html": html])
     }
     @objc func showSecondary() {
         let secondary = NSWindow(contentRect: NSRect(x: 85, y: 100, width: 160, height: 50),
