@@ -175,9 +175,10 @@ The desktop acceptance opens an AppKit fixture in the active, unlocked
 desktop. It drives the fixture through MCP stdio and checks app discovery,
 menu bars, selection, plain and HTML paste, screenshots, a continuous drag
 with one undo, text insertion, accessibility actions, cancellation and
-scrolling. The fixture runs in the background and the test
-compares the foreground application and hardware cursor before and after
-the scripted input. Run it while the pointer is stationary for that comparison.
+scrolling. The fixture keeps its windows behind the active application,
+including with Stage Manager enabled. Tests capture the fixture's windows
+directly and check that the fixture never activates or moves. The foreground
+and hardware cursor comparisons assume both are stationary during the run.
 Use `--desktop-helpers` to run only the app, menu, selection and paste checks.
 The concurrent capture check overlaps two window observations from the same
 bundled executable, with one MCP process per client.

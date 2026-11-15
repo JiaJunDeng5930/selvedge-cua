@@ -144,14 +144,14 @@ def observation(reply, content):
     return manifest
 
 
-def local_screen_change(client, fixture_binary, pid, region, events):
+def local_screen_change(client, fixture_binary, pid, window_id, region, events):
     interval_ms = 90
     reply, content = client.run(f"""
         const all = node => [node,...(node.children ?? []).flatMap(all)];
         const {{window}} = await readUI({{pid:{pid}}});
         const button = all(window).find(n=>n.title==="Pulse");
         const screen = observeScreen({{
-            target: {{region:{json.dumps(region)}}}, durationMs:1450,
+            target: {{windowId:{window_id}}}, durationMs:1450,
             intervalMs:{interval_ms}, imageBudget:3
         }});
         const before = await screen.started;
@@ -190,12 +190,16 @@ def local_screen_change(client, fixture_binary, pid, region, events):
     a, b, final_a = (tile for _, tile in tiles)
     assert a["firstAtMs"] == reply["result"]["before"]["atMs"], a
     assert a["lastAtMs"] < b["firstAtMs"] < b["lastAtMs"] < final_a["firstAtMs"], tiles
-    # The fixture logs both transitions relative to the same AX press that the MCP timed.
+    # The native press occurs between the first frame and the dispatch receipt.
+    # The receipt includes IPC latency, so use those two bounds to locate the
+    # fixture's transitions on the server clock.
+    before_at = reply["result"]["before"]["atMs"]
     sent_at = reply["result"]["press"]["sentAtMs"]
     for earlier, later, event in zip((a, b), (b, final_a), pulse):
-        changed_at = sent_at + (event["time"] - pressed["time"]) * 1000
-        assert earlier["lastAtMs"] <= changed_at + interval_ms, (earlier, changed_at)
-        assert later["firstAtMs"] >= changed_at - interval_ms, (later, changed_at)
+        elapsed = (event["time"] - pressed["time"]) * 1000
+        earliest, latest = before_at + elapsed, sent_at + elapsed
+        assert earlier["lastAtMs"] <= latest + interval_ms, (earlier, latest)
+        assert later["firstAtMs"] >= earliest - interval_ms, (later, earliest)
     viewport = manifest["viewport"]
     index, _ = tiles[-1]
     assert viewport["imageIndex"] == index, viewport
@@ -277,7 +281,14 @@ def desktop(client, fixture, fixture_binary, log_path, concurrent_binary, helper
     window_id = ready["windowId"]
 
     def desktop_state():
-        return json.loads(subprocess.check_output([fixture_binary, "--desktop-state"]))
+        state = json.loads(subprocess.check_output([
+            fixture_binary, "--desktop-state", str(pid), str(window_id),
+        ]))
+        assert state["frontmost"] != pid and not events("activated"), (state, events("activated"))
+        assert not state["fixtureAboveForeground"], state
+        assert not events("geometry"), events("geometry")
+        assert state["fixtureBounds"], state
+        return state
 
     before = desktop_state()
     assert before["frontmost"] != pid, before
@@ -291,10 +302,12 @@ def desktop(client, fixture, fixture_binary, log_path, concurrent_binary, helper
     assert application["pids"] == [pid], application
     assert application["launched"] == {"bundleId": "dev.selvedge.desktop-fixture", "pid": pid}, application
     assert application["menuRole"] == "AXMenuBar" and application["menuItems"] > 0, application
-    assert desktop_state() == before, "Application discovery or menu read changed foreground or hardware cursor"
+    after = desktop_state()
+    assert after == before, ("App discovery or menu read changed the desktop state", before, after)
     if helpers_only:
         desktop_text(client, pid, events)
-        assert desktop_state() == before, "Text selection or paste changed foreground or hardware cursor"
+        after = desktop_state()
+        assert after == before, ("Text selection or paste changed the desktop state", before, after)
         print("App discovery, launch reuse, menus, text selection and clipboard paste passed", flush=True)
         return
     # An exact-window capture can be the first operation of a new server.
@@ -327,13 +340,12 @@ def desktop(client, fixture, fixture_binary, log_path, concurrent_binary, helper
         "fields": ["children", "role", "target", "title", "windowId"],
     }, compact
     print("desktop display and window capture passed", flush=True)
-    local_screen_change(client, fixture_binary, pid, ready["pulseRegion"], events)
-    region = {"region": {"x": x + 12, "y": y + 70, "width": 360, "height": 450}}
+    local_screen_change(client, fixture_binary, pid, ready["pulseWindowId"], ready["pulseRegion"], events)
     after = desktop_state()
     assert after == before, ("Background observation changed foreground or hardware cursor", before, after)
     reply, content = client.run(f"""
         const screen = observeScreen({{
-            target: {json.dumps(region)}, durationMs: 900, intervalMs: 45, imageBudget: 4
+            target: {{windowId:{window_id}}}, durationMs: 900, intervalMs: 45, imageBudget: 4
         }});
         const first = await screen.started;
         const shift = await keyboard({{
@@ -419,9 +431,8 @@ def desktop(client, fixture, fixture_binary, log_path, concurrent_binary, helper
     assert time.monotonic() - started < 4, snapshot
     assert snapshot["operation"] is None and snapshot["held"] == {"buttons": [], "keys": []}, snapshot
 
-    region = {"region": {"x": x + 386, "y": y + 63, "width": 282, "height": 415}}
     reply, content = client.run(f"""
-        const screen=observeScreen({{target:{json.dumps(region)}, durationMs:2400, intervalMs:100}});
+        const screen=observeScreen({{target:{{windowId:{window_id}}}, durationMs:2400, intervalMs:100}});
         await screen.started;
         await scroll({{windowId:{window_id},x:{x+520},y:{y+220},events:[
             {{atMs:200,dx:18,dy:47}},{{atMs:650,dy:41}},
@@ -515,7 +526,6 @@ def main():
                     "CFBundleIdentifier": "dev.selvedge.desktop-fixture",
                     "CFBundleExecutable": "fixture",
                     "CFBundlePackageType": "APPL",
-                    "LSUIElement": True,
                 }))
                 subprocess.run(["swiftc", source, "-o", fixture_binary], check=True)
                 with (root / "fixture.log").open("wb") as log:

@@ -18,10 +18,24 @@ if CommandLine.arguments.dropFirst() == ["--sample-pngs"] {
     exit(0)
 }
 
-if CommandLine.arguments.dropFirst() == ["--desktop-state"] {
+if CommandLine.arguments.dropFirst().first == "--desktop-state" {
+    let fixture = Int32(CommandLine.arguments[2])!
+    let fixtureWindow = UInt32(CommandLine.arguments[3])!
     let point = CGEvent(source: nil)!.location
+    let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+    let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+        as! [[String: Any]]
+    let normalOwners = windows.compactMap { window -> Int32? in
+        guard window[kCGWindowLayer as String] as? Int == 0 else { return nil }
+        return window[kCGWindowOwnerPID as String] as? Int32
+    }
+    let fixtureAboveForeground = normalOwners.lastIndex(of: frontmost).map { index in
+        normalOwners[..<index].contains(fixture)
+    } ?? false
+    let fixtureEntry = windows.first { $0[kCGWindowNumber as String] as? UInt32 == fixtureWindow }
     let state: [String: Any] = [
-        "frontmost": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0,
+        "frontmost": frontmost, "fixtureAboveForeground": fixtureAboveForeground,
+        "fixtureBounds": fixtureEntry?[kCGWindowBounds as String] ?? NSNull(),
         "x": point.x, "y": point.y
     ]
     print(String(data: try JSONSerialization.data(withJSONObject: state), encoding: .utf8)!)
@@ -130,22 +144,24 @@ final class Pulse: NSView {
     }
 }
 
-final class Delegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
+final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
     let window = NSWindow(contentRect: NSRect(x: 200, y: 180, width: 710, height: 530),
                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
     var secondary: NSWindow?
+    private var readyFrame: NSRect?
+    let pulseWindow = NSWindow(contentRect: NSRect(x: 320, y: 240, width: 80, height: 76),
+                               styleMask: .borderless, backing: .buffered, defer: false)
     let drawing = Drawing(frame: NSRect(x: 12, y: 12, width: 360, height: 454))
     let field = NSTextField(frame: NSRect(x: 12, y: 483, width: 235, height: 26))
     let button = NSButton(frame: NSRect(x: 250, y: 483, width: 124, height: 28))
     let slider = NSSlider(value: 2, minValue: 0, maxValue: 10, target: nil, action: nil)
-    let pulse = Pulse(frame: NSRect(x: 125, y: 62, width: 80, height: 76))
+    let pulse = Pulse(frame: NSRect(x: 0, y: 0, width: 80, height: 76))
     let pulseButton = NSButton(frame: NSRect(x: 625, y: 483, width: 70, height: 28))
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let root = window.contentView!
         window.title = "Selvedge CUA Test Fixture"
         root.addSubview(drawing)
-        root.addSubview(pulse)
         let scroll = NSScrollView(frame: NSRect(x: 385, y: 12, width: 310, height: 454))
         scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = true
@@ -179,17 +195,48 @@ final class Delegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         editItem.submenu = edit
         main.addItem(editItem)
         NSApplication.shared.mainMenu = main
-        window.makeKeyAndOrderFront(nil)
+        // Keep ordinary WindowServer windows behind the user's desktop. The
+        // fixture needs an AppKit key window and editor for directed input.
+        window.center()
+        showBehindDesktop(window)
+        window.makeMain()
+        window.makeKey()
         window.makeFirstResponder(field)
-        window.orderFrontRegardless()
-        let location = window.convertToScreen(root.bounds)
+        window.delegate = self
+        pulseWindow.contentView = pulse
+        showBehindDesktop(pulseWindow)
+        DispatchQueue.main.async { self.announceReady() }
+    }
+    private func announceReady() {
+        readyFrame = window.frame
+        let location = window.convertToScreen(window.contentView!.bounds)
         let screenHeight = NSScreen.screens[0].frame.height
-        let pulseLocation = window.convertToScreen(pulse.convert(pulse.bounds, to: nil))
+        let pulseLocation = pulseWindow.frame
         record("ready", ["x": location.minX, "y": screenHeight - location.maxY,
                          "width": location.width, "height": location.height,
                          "pid": ProcessInfo.processInfo.processIdentifier, "windowId": window.windowNumber,
+                         "pulseWindowId": pulseWindow.windowNumber,
                          "pulseRegion": ["x": pulseLocation.minX, "y": screenHeight - pulseLocation.maxY,
                                          "width": pulseLocation.width, "height": pulseLocation.height]])
+    }
+    private func showBehindDesktop(_ window: NSWindow) {
+        // Stage Manager can shrink ordinary background windows into an
+        // off-screen set. Join the current app's set at normal window level.
+        window.collectionBehavior = [.canJoinAllApplications, .stationary, .ignoresCycle]
+        window.animationBehavior = .none
+        window.isMovable = false
+        window.orderBack(nil)
+    }
+    func applicationDidBecomeActive(_ notification: Notification) {
+        record("activated")
+    }
+    func windowDidMove(_ notification: Notification) {
+        if let readyFrame, window.frame != readyFrame {
+            record("geometry", ["initial": NSStringFromRect(readyFrame), "current": NSStringFromRect(window.frame)])
+        }
+    }
+    func windowDidResize(_ notification: Notification) {
+        windowDidMove(notification)
     }
     func controlTextDidChange(_ notification: Notification) {
         record("text", ["value": field.stringValue])
@@ -203,7 +250,7 @@ final class Delegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         let secondary = NSWindow(contentRect: NSRect(x: 85, y: 100, width: 160, height: 50),
                                  styleMask: [.titled, .closable], backing: .buffered, defer: false)
         secondary.title = "Secondary Fixture Window"
-        secondary.orderFrontRegardless()
+        showBehindDesktop(secondary)
         self.secondary = secondary
         record("secondary", ["windowId": secondary.windowNumber])
     }
@@ -224,7 +271,6 @@ final class Delegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 let app = NSApplication.shared
 let delegate = Delegate()
 app.delegate = delegate
-app.setActivationPolicy(.regular)
 signal(SIGUSR1, SIG_IGN)
 let requests = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
 requests.setEventHandler { delegate.showSecondary() }
