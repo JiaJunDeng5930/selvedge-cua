@@ -6,7 +6,8 @@ use std::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rmcp::model::{CallToolResult, ContentBlock};
 use rquickjs::{
-    AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Ctx, Exception, Function, Promise,
+    AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Ctx, Exception, Function, Object,
+    Promise,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -117,7 +118,11 @@ impl<D: Desktop> Invocation<D> {
         // Desktop-changing effects follow script call order. Reads have an
         // independent schedule so the script can observe an ongoing action.
         let mut input_order = match operation {
-            Operation::ObserveScreen | Operation::ReadUi | Operation::ListWindows => None,
+            Operation::ObserveScreen
+            | Operation::ReadUi
+            | Operation::ListWindows
+            | Operation::ListApps
+            | Operation::ReadMenuBar => None,
             _ => {
                 let (done, next) = oneshot::channel();
                 Some((work.last_input.replace(next), done))
@@ -363,6 +368,16 @@ fn bind<'js, D: Desktop>(ctx: &Ctx<'js>, invocation: Arc<Invocation<D>>) -> rqui
         };
         globals.set(name, function.with_name(name)?)?;
     }
+    let desktop = Object::new(ctx.clone())?;
+    for (name, operation) in [
+        ("listApps", Operation::ListApps),
+        ("launchApp", Operation::LaunchApp),
+        ("readMenuBar", Operation::ReadMenuBar),
+    ] {
+        let function = binding(ctx, Arc::clone(&invocation), operation)?;
+        desktop.set(name, function.with_name(name)?)?;
+    }
+    globals.set("desktop", desktop)?;
     Ok(())
 }
 

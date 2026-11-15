@@ -163,6 +163,9 @@ impl selvedge_script_server::Desktop for Desktop {
         match name {
             Operation::ReadUi
             | Operation::ListWindows
+            | Operation::ListApps
+            | Operation::LaunchApp
+            | Operation::ReadMenuBar
             | Operation::Pointer
             | Operation::Keyboard
             | Operation::Scroll => {
@@ -192,6 +195,46 @@ impl selvedge_script_server::Desktop for Desktop {
                         return Err("Listing windows was cancelled".into());
                     }
                     selvedge_macos_ax::list_windows(&options)
+                })
+                .await?
+            }
+            Operation::ListApps => {
+                blocking(move || {
+                    if cancel.is_cancelled() {
+                        return Err("Listing applications was cancelled".into());
+                    }
+                    Ok(json!({"apps": selvedge_macos_desktop::list_apps()}))
+                })
+                .await?
+            }
+            Operation::LaunchApp => {
+                let app: selvedge_macos_desktop::LaunchApp = options_as(options)?;
+                let cancellation = cancel.clone();
+                let bundle_id = blocking(move || {
+                    if cancellation.is_cancelled() {
+                        return Err("Application launch was cancelled before dispatch".into());
+                    }
+                    app.bundle_id()
+                })
+                .await?;
+                if cancel.is_cancelled() {
+                    return Err("Application launch was cancelled before dispatch".into());
+                }
+                // Launch Services owns the request after dispatch. Cancelling
+                // the wait cannot undo an app launch already in progress.
+                let launched = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err("Application launch wait was cancelled".into()),
+                    result = selvedge_macos_desktop::launch_app(bundle_id) => result?,
+                };
+                json!(launched)
+            }
+            Operation::ReadMenuBar => {
+                blocking(move || {
+                    if cancel.is_cancelled() {
+                        return Err("Reading the menu bar was cancelled".into());
+                    }
+                    selvedge_macos_ax::read_menu_bar(&options)
                 })
                 .await?
             }

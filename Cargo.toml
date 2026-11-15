@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 selvedge-rules = { path = "crates/rules" }
 selvedge-macos-ax = { path = "crates/macos-ax" }
+selvedge-macos-desktop = { path = "crates/macos-desktop" }
 selvedge-macos-input = { path = "crates/macos-input" }
 selvedge-macos-screen = { path = "crates/macos-screen" }
 selvedge-script-server = { path = "crates/script-server" }

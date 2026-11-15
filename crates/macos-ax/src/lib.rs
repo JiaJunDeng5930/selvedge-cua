@@ -7,6 +7,7 @@
 //! to different controls after a reordering. The platform owns the live
 //! element and may invalidate the identity at any time.
 
+mod menu_bar;
 mod native;
 mod window_id;
 
@@ -22,6 +23,7 @@ use selvedge_rules::accessibility;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub use menu_bar::read_menu_bar;
 use native::{Attributes, Element};
 pub use window_id::{InputProcess, InputWindow, InputWindowError, input_process, input_window};
 use window_id::{WindowInfo, WindowInput};
@@ -41,8 +43,7 @@ pub fn frontmost_pid() -> Result<i32, String> {
 /// window traversal limits.
 pub fn read_ui(options: &Value) -> Result<Value, String> {
     let options: ReadOptions = decode(options, "readUI")?;
-    let limits = ReadLimits::from_options(&options)?;
-    let fields = ReadFields::new(options.fields)?;
+    let (limits, fields) = options.tree.validate("readUI")?;
     submit(move |accessibility| {
         let selection = match (options.pid, options.window_id) {
             (None, None) => WindowSelection::Frontmost,
@@ -181,6 +182,13 @@ fn decode<T: serde::de::DeserializeOwned>(options: &Value, function: &str) -> Re
 struct ReadOptions {
     pid: Option<i32>,
     window_id: Option<u32>,
+    #[serde(flatten)]
+    tree: TreeOptions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TreeOptions {
     max_depth: Option<usize>,
     max_nodes: Option<usize>,
     fields: Option<Vec<String>>,
@@ -220,12 +228,12 @@ struct ReadLimits {
 struct ReadFields(Option<Vec<String>>);
 
 impl ReadFields {
-    fn new(fields: Option<Vec<String>>) -> Result<Self, String> {
+    fn new(function: &str, fields: Option<Vec<String>>) -> Result<Self, String> {
         if let Some(fields) = &fields {
             for field in fields {
                 if !matches!(field.as_str(), "actions" | "settable") && !native::is_attribute(field)
                 {
-                    return Err(format!("Unknown readUI field: {field}"));
+                    return Err(format!("Unknown {function} field: {field}"));
                 }
             }
         }
@@ -239,16 +247,21 @@ impl ReadFields {
     }
 }
 
-impl ReadLimits {
-    fn from_options(options: &ReadOptions) -> Result<Self, String> {
-        let depth = options.max_depth.unwrap_or(6);
-        let nodes = options.max_nodes.unwrap_or(120);
+impl TreeOptions {
+    fn validate(self, function: &str) -> Result<(ReadLimits, ReadFields), String> {
+        let depth = self.max_depth.unwrap_or(6);
+        let nodes = self.max_nodes.unwrap_or(120);
         // DEFENSE: Callers set traversal limits through JSON. A depth bound
         // keeps recursion finite; a node bound limits IPC and response size.
         if depth > 32 || !(1..=500).contains(&nodes) {
-            return Err("readUI requires maxDepth from 0 to 32 and maxNodes from 1 to 500".into());
+            return Err(format!(
+                "{function} requires maxDepth from 0 to 32 and maxNodes from 1 to 500"
+            ));
         }
-        Ok(Self { depth, nodes })
+        Ok((
+            ReadLimits { depth, nodes },
+            ReadFields::new(function, self.fields)?,
+        ))
     }
 }
 
@@ -297,7 +310,9 @@ impl Target {
             .strip_prefix("ax-")
             .and_then(|value| value.parse().ok())
             .map(Self)
-            .ok_or_else(|| "target must be a reference returned by readUI".into())
+            .ok_or_else(|| {
+                "target must be a reference returned by readUI or desktop.readMenuBar".into()
+            })
     }
 
     fn name(self) -> String {
@@ -378,7 +393,7 @@ impl Accessibility {
             .rev()
             .enumerate()
             .find_map(|(age, read)| read.get(&target).map(|target| (age, target)))
-            .ok_or("the accessibility reference expired or was never returned by readUI")?;
+            .ok_or("the accessibility reference expired or was never returned by readUI or desktop.readMenuBar")?;
         // DEFENSE: A retained AX handle does not keep the application running.
         if !accessibility::reference_live(age, target.application.isTerminated()) {
             return Err("the accessibility reference is no longer live".into());
@@ -434,26 +449,19 @@ impl Accessibility {
             }
             _ => None,
         };
-        let attributes = fields
-            .0
-            .as_ref()
-            .map(|_| Attributes::new(|name| name == "role" || fields.includes(name)));
         let window_attributes = fields.0.as_ref().map(|_| {
             Attributes::new(|name| {
                 matches!(name, "role" | "position" | "size" | "title") || fields.includes(name)
             })
         });
-        let mut read = WindowRead {
+        let mut read = TreeRead::new(
             application,
-            next_target: &mut self.next_target,
-            attributes: attributes.as_ref().unwrap_or(&self.attributes),
-            window_attributes: window_attributes.as_ref().unwrap_or(&self.attributes),
+            &mut self.next_target,
+            &self.attributes,
+            limits,
             fields,
-            targets: HashMap::new(),
-            remaining: limits.nodes,
-            max_depth: limits.depth,
-            truncated: false,
-        };
+            window_attributes.as_ref(),
+        );
         let selected = window.is_some();
         let mut window = window
             .map(|window| read.tree(window, 0))
@@ -496,11 +504,16 @@ impl Accessibility {
             "truncated": read.truncated,
             "windowInput": window_input,
         });
-        self.reads.push_back(read.targets);
+        let targets = read.targets;
+        self.retain_targets(targets);
+        Ok(result)
+    }
+
+    fn retain_targets(&mut self, targets: HashMap<Target, RetainedTarget>) {
+        self.reads.push_back(targets);
         if !accessibility::retained_read(self.reads.len() - 1) {
             self.reads.pop_front();
         }
-        Ok(result)
     }
 }
 
@@ -563,11 +576,12 @@ fn frontmost_application() -> Result<Retained<NSRunningApplication>, String> {
         .ok_or_else(|| "no application currently receives keyboard events".into())
 }
 
-struct WindowRead<'a> {
+struct TreeRead<'a> {
     application: Retained<NSRunningApplication>,
     next_target: &'a mut u64,
-    attributes: &'a Attributes,
-    window_attributes: &'a Attributes,
+    all_attributes: &'a Attributes,
+    selected_attributes: Option<Attributes>,
+    window_attributes: Option<&'a Attributes>,
     fields: ReadFields,
     targets: HashMap<Target, RetainedTarget>,
     remaining: usize,
@@ -575,7 +589,33 @@ struct WindowRead<'a> {
     truncated: bool,
 }
 
-impl WindowRead<'_> {
+impl<'a> TreeRead<'a> {
+    fn new(
+        application: Retained<NSRunningApplication>,
+        next_target: &'a mut u64,
+        all_attributes: &'a Attributes,
+        limits: ReadLimits,
+        fields: ReadFields,
+        window_attributes: Option<&'a Attributes>,
+    ) -> Self {
+        let selected_attributes = fields
+            .0
+            .as_ref()
+            .map(|_| Attributes::new(|name| name == "role" || fields.includes(name)));
+        Self {
+            application,
+            next_target,
+            all_attributes,
+            selected_attributes,
+            window_attributes,
+            fields,
+            targets: HashMap::new(),
+            remaining: limits.nodes,
+            max_depth: limits.depth,
+            truncated: false,
+        }
+    }
+
     fn describe(
         &mut self,
         element: Element,
@@ -597,10 +637,14 @@ impl WindowRead<'_> {
         element: Element,
         window_root: bool,
     ) -> Result<serde_json::Map<String, Value>, native::Error> {
+        let attributes = self
+            .selected_attributes
+            .as_ref()
+            .unwrap_or(self.all_attributes);
         let attributes = if window_root {
-            self.window_attributes
+            self.window_attributes.unwrap_or(attributes)
         } else {
-            self.attributes
+            attributes
         };
         let mut node = attributes.read(&element)?;
         let include_actions = self.fields.includes("actions");

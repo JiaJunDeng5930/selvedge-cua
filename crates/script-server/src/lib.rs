@@ -28,6 +28,9 @@ pub enum Operation {
     Scroll,
     InsertText,
     PerformUiAction,
+    ListApps,
+    LaunchApp,
+    ReadMenuBar,
 }
 
 pub struct Response {

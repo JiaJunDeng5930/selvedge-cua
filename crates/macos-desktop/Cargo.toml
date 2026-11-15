@@ -1,0 +1,13 @@
+[package]
+name = "selvedge-macos-desktop"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSRunningApplication", "NSWorkspace", "block2", "libc"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSError", "NSString", "NSURL"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["sync"] }

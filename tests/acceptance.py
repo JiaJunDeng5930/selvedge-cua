@@ -96,10 +96,11 @@ def protocol(client):
             keyboard({events: [{key: 'InvalidKey', down: true}], pid: __SELF_PID__})
                 .then(() => null, e => e.message)
         ]);
-        return {methods: methods.map(f => typeof f), receipts};
+        return {methods: methods.map(f => typeof f), desktop: Object.keys(desktop).sort(), receipts};
         """.replace("__SELF_PID__", str(client.process.pid))
     )
     assert result["result"]["methods"] == ["function"] * 8, result
+    assert result["result"]["desktop"] == ["launchApp", "listApps", "readMenuBar"], result
     assert "sample at 0" in result["result"]["receipts"][0], result
     assert "InvalidKey" in result["result"]["receipts"][1], result
     result, _ = client.run("throw new Error('intentional failure')", expect_error=True)
@@ -249,6 +250,17 @@ def desktop(client, fixture, fixture_binary, log_path, concurrent_binary):
 
     before = desktop_state()
     assert before["frontmost"] != pid, before
+    application = result(client, f"""
+        const app = (await desktop.listApps()).apps.find(app => app.bundleId === "dev.selvedge.desktop-fixture");
+        const launched = await desktop.launchApp({{bundleId: app.bundleId}});
+        const {{menuBar}} = await desktop.readMenuBar({{pid: {pid}, maxDepth: 2, fields: ["title"]}});
+        return {{pids: app.pids, launched, menuRole: menuBar.role,
+                 menuItems: menuBar.children.filter(node => node.role === "AXMenuBarItem" && node.title).length}};
+    """)
+    assert application["pids"] == [pid], application
+    assert application["launched"] == {"bundleId": "dev.selvedge.desktop-fixture", "pid": pid}, application
+    assert application["menuRole"] == "AXMenuBar" and application["menuItems"] > 0, application
+    assert desktop_state() == before, "Application discovery or menu read changed foreground or hardware cursor"
     # An exact-window capture can be the first operation of a new server.
     for target in ({"target": {"windowId": window_id}}, {}):
         reply, content = client.run(f"return await observeScreen({json.dumps(target)});")
