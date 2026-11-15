@@ -4,6 +4,8 @@
 <dict>
     <key>CFBundleExecutable</key>
     <string>selvedge-cua-mcp</string>
+    <key>CFBundleIconFile</key>
+    <string>Selvedge.icns</string>
     <key>CFBundleIdentifier</key>
     <string>dev.selvedge.cua-mcp</string>
     <key>CFBundleName</key>

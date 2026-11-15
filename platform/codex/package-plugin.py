@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from shutil import copyfile
 
 
 def write_json(path, value):
@@ -23,9 +24,13 @@ def main():
 
     marketplace = options.marketplace.resolve()
     plugin = marketplace / "plugins/selvedge"
+    icon = "./assets/selvedge-cua.png"
+    packaged_icon = plugin / icon
+    packaged_icon.parent.mkdir(parents=True, exist_ok=True)
+    copyfile(Path(__file__).resolve().parents[2] / icon, packaged_icon)
     write_json(plugin / ".codex-plugin/plugin.json", {
         "name": "selvedge",
-        "version": "0.1.1",
+        "version": "0.1.2",
         "description": "Observe and automate macOS app windows with Selvedge CUA MCP.",
         "mcpServers": "./.mcp.json",
         "interface": {
@@ -33,6 +38,8 @@ def main():
             "shortDescription": "Observe and automate macOS app windows.",
             "category": "Engineering",
             "capabilities": ["Read", "Write"],
+            "composerIcon": icon,
+            "logo": icon,
         },
     })
     write_json(plugin / ".mcp.json", {

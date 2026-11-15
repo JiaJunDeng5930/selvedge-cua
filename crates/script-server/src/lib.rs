@@ -3,10 +3,11 @@
 
 use std::{error::Error, future::Future, io, sync::Arc};
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use rmcp::{
     RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig},
+    model::{CallToolResult, Icon, Implementation, ServerCapabilities, ServerConfig},
     schemars,
     service::{QuitReason, RequestContext},
     tool, tool_handler, tool_router,
@@ -103,9 +104,18 @@ struct Run {
     code: String,
 }
 
+fn selvedge_icons() -> Vec<Icon> {
+    let png = include_bytes!("../../../assets/selvedge-cua.png");
+    vec![
+        Icon::new(format!("data:image/png;base64,{}", STANDARD.encode(png)))
+            .with_mime_type("image/png")
+            .with_sizes(vec!["512x512".into()]),
+    ]
+}
+
 #[tool_router(router = tools)]
 impl<D: Desktop> Server<D> {
-    #[tool(description = include_str!("run-api.md"))]
+    #[tool(description = include_str!("run-api.md"), icons = selvedge_icons())]
     async fn run(
         &self,
         Parameters(Run { code }): Parameters<Run>,
@@ -137,10 +147,10 @@ impl<D: Desktop> Server<D> {
 impl<D: Desktop> ServerHandler for Server<D> {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new(
-                "selvedge-cua-mcp",
-                env!("CARGO_PKG_VERSION"),
-            ))
+            .with_server_info(
+                Implementation::new("selvedge-cua-mcp", env!("CARGO_PKG_VERSION"))
+                    .with_icons(selvedge_icons()),
+            )
             .with_instructions(
                 "Use run({code}) with an async JavaScript function body. Find background \
                  windows with listWindows({bundleId}), then readUI({windowId}). Use the \

@@ -22,7 +22,9 @@ fi
 staging="$(mktemp -d "$output_dir/.selvedge-app.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
 bundle="$staging/$(basename "$app")"
-mkdir -p "$bundle/Contents/MacOS"
+png="$platform_dir/../../assets/selvedge-cua.png"
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+/usr/bin/sips -s format icns "$png" --out "$bundle/Contents/Resources/Selvedge.icns" >/dev/null
 install -m 644 "$plist" "$bundle/Contents/Info.plist"
 install -m 755 "$source" "$bundle/Contents/MacOS/$executable"
 /usr/bin/codesign --force --sign "$identity" --identifier "$identifier" ${signing_options[@]+"${signing_options[@]}"} "$bundle"
