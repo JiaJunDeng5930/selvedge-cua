@@ -87,6 +87,12 @@ class Client:
 def protocol(client):
     tools = client.request("tools/list", {})["tools"]
     assert [tool["name"] for tool in tools] == ["run"]
+    description = tools[0]["description"]
+    assert "`maxNodes` is an integer from 1 to 500" in description
+    assert "`position` is `{x,y}` and `size` is `{width,height}`" in description
+    assert all(f"`desktop.{method}(" in description for method in (
+        "listApps", "launchApp", "readMenuBar", "selectText", "paste",
+    ))
     result, _ = client.run(
         """
         const methods = [observeScreen, listWindows, readUI, pointer, keyboard, scroll, insertText, performUIAction];
@@ -231,7 +237,32 @@ def concurrent_capture(client, window_id, binary):
     print("concurrent window capture passed for two MCP processes", flush=True)
 
 
-def desktop(client, fixture, fixture_binary, log_path, concurrent_binary):
+def desktop_text(client, pid, events):
+    result(client, f"""
+        const ui = await readUI({{pid:{pid}}});
+        return await insertText({{target:ui.focused.target,text:"Hello 世界🙂"}});
+    """)
+    time.sleep(.15)
+    assert events("text")[-1]["value"] == "Hello 世界🙂", events("text")
+
+    paste = result(client, f"""
+        const {{focused: {{target}}}} = await readUI({{pid:{pid}}});
+        const selection = await desktop.selectText({{target,text:"世界🙂",prefix:"Hello "}});
+        const paste = await desktop.paste({{target,text:"background"}});
+        return {{selection: selection.range,paste}};
+    """)
+    assert paste == {"selection": {"location": 6, "length": 4}, "paste": {"pid": pid, "clipboardRestored": True}}, paste
+    assert events("text")[-1]["value"] == "Hello background", (events("paste"), events("text"))
+    rich_paste = result(client, f"""
+        const {{focused: {{target}}}} = await readUI({{pid:{pid}}});
+        await desktop.selectText({{target,text:"background"}});
+        return await desktop.paste({{target,format:"html",text:"<strong>rich</strong>",plainText:"rich"}});
+    """)
+    assert rich_paste == {"pid": pid, "clipboardRestored": True}, rich_paste
+    assert events("paste")[-1]["html"] and events("text")[-1]["value"] == "Hello rich"
+
+
+def desktop(client, fixture, fixture_binary, log_path, concurrent_binary, helpers_only=False):
     def events(kind):
         if not log_path.exists():
             return []
@@ -261,6 +292,11 @@ def desktop(client, fixture, fixture_binary, log_path, concurrent_binary):
     assert application["launched"] == {"bundleId": "dev.selvedge.desktop-fixture", "pid": pid}, application
     assert application["menuRole"] == "AXMenuBar" and application["menuItems"] > 0, application
     assert desktop_state() == before, "Application discovery or menu read changed foreground or hardware cursor"
+    if helpers_only:
+        desktop_text(client, pid, events)
+        assert desktop_state() == before, "Text selection or paste changed foreground or hardware cursor"
+        print("App discovery, launch reuse, menus, text selection and clipboard paste passed", flush=True)
+        return
     # An exact-window capture can be the first operation of a new server.
     for target in ({"target": {"windowId": window_id}}, {}):
         reply, content = client.run(f"return await observeScreen({json.dumps(target)});")
@@ -340,28 +376,7 @@ def desktop(client, fixture, fixture_binary, log_path, concurrent_binary):
     time.sleep(.12)
     assert [e["strokes"] for e in events("undo")] == [0], log_path.read_text()
 
-    result(client, f"""
-        const ui = await readUI({{pid:{pid}}});
-        return await insertText({{target:ui.focused.target,text:"Hello 世界🙂"}});
-    """)
-    time.sleep(.15)
-    assert events("text")[-1]["value"] == "Hello 世界🙂", log_path.read_text()
-
-    paste = result(client, f"""
-        const {{focused: {{target}}}} = await readUI({{pid:{pid}}});
-        const selection = await desktop.selectText({{target,text:"世界🙂",prefix:"Hello "}});
-        const paste = await desktop.paste({{target,text:"background"}});
-        return {{selection: selection.range,paste}};
-    """)
-    assert paste == {"selection": {"location": 6, "length": 4}, "paste": {"pid": pid, "clipboardRestored": True}}, paste
-    assert events("text")[-1]["value"] == "Hello background", (events("paste"), events("text"))
-    rich_paste = result(client, f"""
-        const {{focused: {{target}}}} = await readUI({{pid:{pid}}});
-        await desktop.selectText({{target,text:"background"}});
-        return await desktop.paste({{target,format:"html",text:"<strong>rich</strong>",plainText:"rich"}});
-    """)
-    assert rich_paste == {"pid": pid, "clipboardRestored": True}, rich_paste
-    assert events("paste")[-1]["html"] and events("text")[-1]["value"] == "Hello rich"
+    desktop_text(client, pid, events)
     assert desktop_state() == before, "Text selection or paste changed foreground or hardware cursor"
 
     value = result(client, f"""
@@ -475,7 +490,9 @@ def desktop(client, fixture, fixture_binary, log_path, concurrent_binary):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
-    parser.add_argument("--desktop", action="store_true")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--desktop", action="store_true")
+    group.add_argument("--desktop-helpers", action="store_true")
     parser.add_argument("--concurrent-capture", action="store_true")
     options = parser.parse_args()
     binary = options.binary.resolve()
@@ -487,7 +504,7 @@ def main():
     with Client(binary) as client:
         protocol(client)
         print("MCP protocol passed")
-        if options.desktop:
+        if options.desktop or options.desktop_helpers:
             with tempfile.TemporaryDirectory(prefix="selvedge-acceptance-") as directory:
                 root = Path(directory)
                 source = Path(__file__).with_name("DesktopFixture.swift")
@@ -509,6 +526,7 @@ def main():
                     desktop(
                         client, fixture, fixture_binary, root / "events.json",
                         binary if options.concurrent_capture else None,
+                        options.desktop_helpers,
                     )
                 finally:
                     fixture.terminate()

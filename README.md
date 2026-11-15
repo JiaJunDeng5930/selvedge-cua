@@ -105,55 +105,15 @@ await pointer({
 return await observation.finished;
 ```
 
-| Function | Options and behavior |
-| --- | --- |
-| `observeScreen` | `{durationMs?, intervalMs?, imageBudget?, preserveInputBoundaries?, target?, maxDimension?}`. A zero duration gives one frame. The default target is the main display. Set `target` to `{displayId}`, `{windowId}`, or `{region: {x, y, width, height}}`. A positive `maxDimension` caps the longest side of each sampled viewport in pixels without enlarging smaller frames. Await `.started` for the first frame's time. Await the observation directly or via `.finished` for the image manifest. Set `preserveInputBoundaries: true` to keep identical samples taken after different completed input dispatches. |
-| `listWindows` | `{bundleId}` or `{pid}`. Returns `{windows}` with `windowId`, `pid`, `title`, `bounds` as `[x, y, width, height]`, and `onScreen`. macOS may omit window titles. |
-| `readUI` | `{pid?, windowId?, maxDepth?, maxNodes?, fields?}`. Pass at most one of `pid` and `windowId`. By default reads the foreground app's current window. Returns the window tree, focused element, input snapshot, observation time and `windowInput`. With an explicit window ID the focused element belongs to that window, if observed. |
-| `pointer` | `{windowId?, position, durationMs?, intervalMs?, buttons?, hold?, operation?}`. A new trajectory requires a window ID. The function receives the elapsed milliseconds and returns `{x, y}`. The default duration is zero and the default sample interval is 16 ms. Buttons 0, 1 and 2 correspond to left, right and middle. |
-| `keyboard` | `{pid?, events, hold?, operation?}`. Supply the PID for a new keyboard operation. Each event is `{atMs?, key, down}`. Physical key names use `KeyboardEvent.code` names such as `KeyA`, `ShiftLeft` and `ArrowDown`. |
-| `scroll` | `{windowId?, x, y, events, operation?}`. Supply a window ID or a window-bound operation. Each event is `{atMs?, dx?, dy?}` in pixels. Positive deltas scroll right and down. Passing an operation preserves its held controls. |
-| `insertText` | `{target, text}`. Pass the `target` returned by `readUI` for the focused editable text field in the target application. |
-| `performUIAction` | `{target, action, value?}`. Use an action exposed by `readUI`. `AXSetValue` accepts a JSON string, number or boolean on writable controls. |
+The [JavaScript API reference](crates/script-server/src/run-api.md) is also
+published as the `run` tool description. Use the `desktop` namespace for
+application discovery and launch, menu bars, text selection and clipboard
+paste. Window observation and input use the top-level functions shown above.
 
-Omit `readUI.fields` for all node attributes. Pass a list containing any of
-`role`, `subrole`, `title`, `description`, `value`, `position`, `size`,
-`enabled`, `identifier`, `help`, `placeholder`, `actions`, and `settable`
-to limit the attributes read and returned. Each node still provides its
-`role` and `target`, the window tree retains its children, and the root
-includes `windowId` when `windowInput.status` is `ready`. The other statuses are
-`unmatched`, `ambiguous`, and `unavailable`. An unavailable status includes
-the ID of the absent or off-screen window. Input rechecks window identity
-and geometry. Pointer and scroll rejections expose `windowRequired`,
-`windowUnavailable`, `windowOwnerChanged`, or `windowGeometryChanged` in
-JavaScript's `error.code` and in `structuredContent.code` for uncaught errors.
-
-Times with the `AtMs` suffix are measured in milliseconds since the server
-started. Event offsets are relative to the start of their input plan. Pointer
-and scroll coordinates use global desktop logical points, with the origin at
-the top-left of the main display. Input plans allow up to 30 seconds and 1024
-trajectory samples or explicit events. Observation allows up to 30 seconds,
-24 frames and an image budget of 1–12. Frame rates depend on macOS delivery.
-
-A successful input call reports the dispatch times and held controls. Set
-`hold: true` to keep controls down and get an operation reference. Pass that
-reference in a later input call to continue the same action, including across
-MCP calls. `pointer({operation})` releases the controls without moving.
-A cancelled plan stops between dispatches and releases the controls still
-recorded as held. A plan interrupted after dispatch begins includes a partial
-receipt in the rejection message. An application may react after the dispatch
-completes.
-
-The MCP result has `structuredContent.result` and
-`structuredContent.observations`. The latter contains each successful
-observation and its `imageOffset` and `imageCount` among PNG attachments.
-Add `imageOffset` to a tile's `imageIndex` to locate the attachment. The tile's
-`imageRect` is the pixel rectangle in that PNG, and its `desktopRect` describes
-the source in desktop points. Use the manifest's `viewport` for the last real
-capture. Each tile carries its representative capture time and the bounds of
-the sample interval it represents. These times record macOS capture delivery.
-The same desktop coordinates apply at every output resolution. A mosaic can
-cover several viewports, so `maxDimension` bounds each sample.
+```js
+const app = await desktop.launchApp({ bundleId: "com.apple.TextEdit" });
+return await desktop.readMenuBar({ pid: app.pid, maxDepth: 2, fields: ["title", "actions"] });
+```
 
 Consecutive equivalent captures share one interval. If the sampled sequence is
 A, A, A, B, A, the three intervals show whole frames A, B, A. Aligned scrolling
@@ -212,11 +172,13 @@ python3 tests/acceptance.py \
 ```
 
 The desktop acceptance opens an AppKit fixture in the active, unlocked
-desktop. It drives the fixture through MCP stdio and checks screenshots,
-a continuous drag with one undo, text insertion, accessibility actions,
-cancellation and scrolling. The fixture runs in the background and the test
+desktop. It drives the fixture through MCP stdio and checks app discovery,
+menu bars, selection, plain and HTML paste, screenshots, a continuous drag
+with one undo, text insertion, accessibility actions, cancellation and
+scrolling. The fixture runs in the background and the test
 compares the foreground application and hardware cursor before and after
 the scripted input. Run it while the pointer is stationary for that comparison.
+Use `--desktop-helpers` to run only the app, menu, selection and paste checks.
 The concurrent capture check overlaps two window observations from the same
 bundled executable, with one MCP process per client.
 

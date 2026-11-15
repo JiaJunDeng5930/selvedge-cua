@@ -105,9 +105,7 @@ struct Run {
 
 #[tool_router(router = tools)]
 impl<D: Desktop> Server<D> {
-    #[tool(
-        description = "Run async JavaScript with observeScreen, listWindows, readUI, pointer, keyboard, scroll, insertText and performUIAction. Return JSON data. Screen observations attach PNG images."
-    )]
+    #[tool(description = include_str!("run-api.md"))]
     async fn run(
         &self,
         Parameters(Run { code }): Parameters<Run>,
@@ -144,12 +142,10 @@ impl<D: Desktop> ServerHandler for Server<D> {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Use run({code}) with an async JavaScript function body. \
-                 Find background windows with listWindows({bundleId}), then readUI({windowId}). \
-                 Start pointer input with a ready windowId from readUI and keyboard input with the target pid. \
-                 Pass the operation reference to continue held input. \
-                 observeScreen(options) has started and finished promises and can also be awaited directly. \
-                 The result includes observations with image offsets into the PNG attachments.",
+                "Use run({code}) with an async JavaScript function body. Find background \
+                 windows with listWindows({bundleId}), then readUI({windowId}). Use the \
+                 desktop namespace for app discovery and launch, menu bars, text selection and paste. \
+                 The run tool description contains the JavaScript API reference.",
             )
     }
 }
