@@ -153,6 +153,18 @@ def rejects_physical_capture(binary, root):
         assert_lifecycle(commands(log), min_checks=0)
 
 
+def rejects_app_audio(binary, root):
+    client, log = start_client(
+        binary, root, "app-audio", begin={"state": "protected"},
+        check={"state": "ok"}, finish={"state": "locked"},
+    )
+    with client:
+        for code in ("return await startListening({pid:1});", "return await readTranscript();"):
+            result, _ = client.run(code, expect_error=True)
+            assert "unavailable with Locked Use enabled" in result["error"], result
+        assert commands(log) == [], commands(log)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
@@ -170,6 +182,7 @@ def main():
         finish_failure(binary, root, relocked=False)
         finish_failure(binary, root, relocked=True)
         rejects_physical_capture(binary, root)
+        rejects_app_audio(binary, root)
     print("Locked Use MCP protocol and authorization passed")
 
 

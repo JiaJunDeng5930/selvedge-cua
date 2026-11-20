@@ -21,6 +21,13 @@ Coordinates are global logical desktop points from the top-left of the main disp
 
 Omit `fields` to request all supported attributes, or pass a list drawn from `role`, `subrole`, `title`, `description`, `value`, `position`, `size`, `enabled`, `identifier`, `help`, `placeholder`, `actions` and `settable`. An element always has `role` where exposed and a `target` reference. Tree nodes have `children` arrays. `position` is `{x,y}` and `size` is `{width,height}`. Attributes can be absent when the app does not expose them. `window.windowId` is present when the window is ready for input. References expire after eight newer tree reads, when the application exits, or if the element stops existing.
 
+## App audio transcription
+
+- `startListening({pid,durationMs?,language?})` starts one audio observation for the current run and returns `{pid,backend}` once the tap is open. Supply the positive PID of the process that plays audio. For apps that delegate playback, the audio process can differ from the window owner. `durationMs` is 1–30000 (default 15000). Supply a language such as `"zh"`, `"en"`, or `"en-GB"`. If omitted or set to `"auto"`, `appleSpeech` uses the preferred system language and `whisper` detects the language from audio.
+- `readTranscript({waitMs?,stop?})` returns `{pid,finished,segments}` for that observation. Each newly available segment is delivered once as `{startMs,endMs,text}`. The times are offsets in the captured audio. With no segments ready, `waitMs` waits for a segment or for completion (0–5000, default 0). `stop:true` stops capture and waits for the final segments. At the duration limit, capture stops automatically and finalization can continue until the transcript is finished.
+
+Once the target PID has registered with Core Audio, await `startListening` before triggering playback. Await transcript reads in sequence. Return the transcript in the same `run`; returning from the script releases the tap. App audio transcription is available in ordinary desktop sessions on macOS 14.2 or later with system audio recording permission. The server tries the installed Apple SpeechTranscriber language asset first on macOS 26 or later, then the configured local Whisper model.
+
 ## Desktop helpers
 
 - `desktop.listApps()` returns `{apps:[{bundleId,name,pids}]}`. It discovers running regular apps and bundled apps in `/Applications`, `/System/Applications` and `~/Applications` including subfolders. An empty `pids` array indicates no running regular instance was observed. The bundle ID can be used for window discovery or launch.

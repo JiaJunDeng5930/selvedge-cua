@@ -119,6 +119,7 @@ impl<D: Desktop> Invocation<D> {
         // independent schedule so the script can observe an ongoing action.
         let mut input_order = match operation {
             Operation::ObserveScreen
+            | Operation::ReadTranscript
             | Operation::ReadUi
             | Operation::ListWindows
             | Operation::ListApps
@@ -342,6 +343,8 @@ fn bind<'js, D: Desktop>(ctx: &Ctx<'js>, invocation: Arc<Invocation<D>>) -> rqui
     let globals = ctx.globals();
     for (name, operation) in [
         ("observeScreen", Operation::ObserveScreen),
+        ("startListening", Operation::StartListening),
+        ("readTranscript", Operation::ReadTranscript),
         ("readUI", Operation::ReadUi),
         ("listWindows", Operation::ListWindows),
         ("pointer", Operation::Pointer),

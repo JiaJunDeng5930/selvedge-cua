@@ -27,8 +27,24 @@ mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
 /usr/bin/sips -s format icns "$png" --out "$bundle/Contents/Resources/Selvedge.icns" >/dev/null
 install -m 644 "$plist" "$bundle/Contents/Info.plist"
 install -m 755 "$source" "$bundle/Contents/MacOS/$executable"
+sdk_version="$(xcrun --sdk macosx --show-sdk-version)"
+if [[ ${sdk_version%%.*} -ge 26 ]]; then
+    speech="$bundle/Contents/MacOS/selvedge-apple-speech"
+    architectures="$(lipo -archs "$source")"
+    speech_archives=()
+    for arch in $architectures; do
+        thin_speech="$staging/selvedge-apple-speech-$arch"
+        xcrun --sdk macosx swiftc -parse-as-library -O -target "$arch-apple-macosx14.0" \
+            -module-cache-path "$staging/swift-cache" \
+            "$platform_dir/AppleSpeechTranscriber.swift" -o "$thin_speech"
+        speech_archives+=("$thin_speech")
+    done
+    lipo -create "${speech_archives[@]}" -output "$speech"
+    /usr/bin/codesign --force --sign "$identity" --identifier "$identifier.apple-speech" \
+        ${signing_options[@]+"${signing_options[@]}"} "$speech"
+fi
 /usr/bin/codesign --force --sign "$identity" --identifier "$identifier" ${signing_options[@]+"${signing_options[@]}"} "$bundle"
-/usr/bin/codesign --verify --strict "$bundle"
+/usr/bin/codesign --verify --deep --strict "$bundle"
 
 # Keep the live bundle path until the replacement has passed signature verification.
 if [[ -d "$app" ]]; then

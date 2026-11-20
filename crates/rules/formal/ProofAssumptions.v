@@ -39,3 +39,14 @@ Print Assumptions overview_keeps_desktop_area.
 Require Import LockedUseRequirement.
 Print Assumptions confirmation_matches_contract.
 Print Assumptions successful_reply_follows_relock_and_all_effects.
+
+Require Import AudioRules.
+Print Assumptions managed_run_cannot_observe_audio.
+Print Assumptions audio_start_contract.
+Print Assumptions listen_duration_contract.
+Print Assumptions transcript_wait_contract.
+Print Assumptions capture_cancel_aborts.
+Print Assumptions capture_stop_drains.
+Print Assumptions transcript_drain_respects_batches.
+Print Assumptions transcript_finalization_returns_prefix.
+Print Assumptions stopping_waits_for_finalization.

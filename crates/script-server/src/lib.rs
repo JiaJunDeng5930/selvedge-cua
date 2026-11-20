@@ -22,6 +22,8 @@ mod script;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
     ObserveScreen,
+    StartListening,
+    ReadTranscript,
     ReadUi,
     ListWindows,
     Pointer,

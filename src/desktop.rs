@@ -5,6 +5,7 @@ use crate::{
     input::Input,
     locked_use::{DesktopPermission, LockedUse},
 };
+use selvedge_macos_audio::AudioObserver;
 use selvedge_macos_screen::{self as screen, TimedFrame};
 use selvedge_script_server::{Operation, OperationError, Response};
 use serde::Deserialize;
@@ -25,6 +26,7 @@ pub struct Desktop {
     input: Input,
     locked_use: LockedUse,
     capture: Mutex<()>,
+    audio: Option<AudioObserver>,
 }
 
 impl Desktop {
@@ -32,6 +34,8 @@ impl Desktop {
         Self {
             clock: Instant::now(),
             input: Input::new(helper.is_some()),
+            audio: selvedge_rules::audio::audio_available(helper.is_some())
+                .then(AudioObserver::default),
             locked_use: LockedUse::new(helper),
             capture: Mutex::new(()),
         }
@@ -151,7 +155,13 @@ impl selvedge_script_server::Desktop for Desktop {
         started: Option<oneshot::Sender<Result<Value, String>>>,
         cancel: CancellationToken,
     ) -> Result<Response, OperationError> {
-        let permission = match self.locked_use.acquire(&cancel).await {
+        let access = match name {
+            Operation::StartListening | Operation::ReadTranscript => {
+                Ok(DesktopPermission::default())
+            }
+            _ => self.locked_use.acquire(&cancel).await,
+        };
+        let permission = match access {
             Ok(permission) => permission,
             Err(error) => {
                 if let Some(started) = started {
@@ -176,6 +186,17 @@ impl selvedge_script_server::Desktop for Desktop {
         let value = match name {
             Operation::ObserveScreen => {
                 return Ok(self.observe(options, started, cancel, &permission).await?);
+            }
+            Operation::StartListening | Operation::ReadTranscript => {
+                let audio = self
+                    .audio
+                    .as_ref()
+                    .ok_or("App audio observation is unavailable with Locked Use enabled")?;
+                if name == Operation::StartListening {
+                    json!(audio.start_listening(options_as(options)?, cancel).await?)
+                } else {
+                    json!(audio.read_transcript(options_as(options)?, cancel).await?)
+                }
             }
             Operation::ReadUi => {
                 let mut ui = blocking(move || {
@@ -322,15 +343,24 @@ impl selvedge_script_server::Desktop for Desktop {
     }
 
     async fn finish_run(&self, successful: bool) -> Result<(), String> {
+        let audio = match &self.audio {
+            Some(audio) => audio.finish_run().await,
+            None => Ok(()),
+        };
         let permission = self.locked_use.permission().await;
         let input = self
             .input
             .finish_run(successful, self.clock, &permission)
             .await;
         let relock = self.locked_use.finish().await;
-        match (input, relock) {
-            (Ok(()), result) | (result, Ok(())) => result,
-            (Err(input), Err(relock)) => Err(format!("{input}; {relock}")),
+        let errors: Vec<_> = [input, relock, audio]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
         }
     }
 }

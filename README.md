@@ -74,6 +74,29 @@ When migrating from the direct MCP configuration above, run
 plugin owns the server registration. Reopen the desktop app to refresh
 the plugin list, then type `@Selvedge` in a local Codex chat.
 
+### Enable app audio transcription
+
+App audio transcription uses a Core Audio process tap on macOS 14.2 or later.
+Build with CMake and libclang available from Xcode. Use the packaged app and
+grant system audio recording access when macOS prompts.
+
+On macOS 26 or later, a bundle built with the macOS 26 SDK or newer can use
+Apple SpeechTranscriber with an installed language asset. Run the bundled
+helper once for each language you need, for example:
+
+```sh
+'target/release/Selvedge CUA MCP.app/Contents/MacOS/selvedge-apple-speech' --install zh
+```
+
+To configure local Whisper as a fallback, download a multilingual GGML model
+such as [Whisper small][whisper-models] and put it at
+`~/Library/Application Support/Selvedge CUA MCP/whisper-model.bin`, or set
+`SELVEDGE_WHISPER_MODEL` in the MCP server's environment to the model file.
+The server loads it on demand. Audio stays in memory, and the script can
+return transcript segments as JSON.
+
+[whisper-models]: https://huggingface.co/ggerganov/whisper.cpp/tree/main
+
 ## Write a script
 
 A script can return any JSON-serializable value. Native calls return promises
@@ -158,8 +181,9 @@ session.
 
 [`Requirement.v`](crates/rules/formal/Requirement.v) derives the desktop
 contracts from engineering needs. The executable rules, including
-[`ObservationRules.v`](crates/rules/formal/ObservationRules.v), are in the same
-directory. The Cargo build checks the Rocq
+[`ObservationRules.v`](crates/rules/formal/ObservationRules.v) and
+[`AudioRules.v`](crates/rules/formal/AudioRules.v), are in the same directory.
+The Cargo build checks the Rocq
 objects, audits theorem assumptions, and extracts the functions used by the
 Rust adapters. The system clock, image measurements, JavaScript engine,
 and macOS responses are external inputs to those rules.

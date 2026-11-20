@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 pub mod accessibility;
+pub mod audio;
 mod convert;
 pub mod input;
 pub mod locked_use;

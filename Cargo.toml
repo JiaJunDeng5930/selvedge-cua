@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 selvedge-rules = { path = "crates/rules" }
+selvedge-macos-audio = { path = "crates/macos-audio" }
 selvedge-macos-ax = { path = "crates/macos-ax" }
 selvedge-macos-desktop = { path = "crates/macos-desktop" }
 selvedge-macos-input = { path = "crates/macos-input" }

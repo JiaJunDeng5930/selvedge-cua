@@ -2,6 +2,7 @@
 
 Pass --desktop to use a real AppKit fixture in an authorized desktop session.
 Pass --concurrent-capture along with --desktop to test two bundled MCP processes.
+Pass --audio-sample to test local transcription of a known speech recording.
 """
 
 import argparse
@@ -95,7 +96,8 @@ def protocol(client):
     ))
     result, _ = client.run(
         """
-        const methods = [observeScreen, listWindows, readUI, pointer, keyboard, scroll, insertText, performUIAction];
+        const methods = [observeScreen, listWindows, readUI, pointer, keyboard, scroll, insertText, performUIAction,
+                         startListening, readTranscript];
         const receipts = await Promise.all([
             pointer({position: t => {throw new Error('sample at ' + t)}, durationMs: 22})
                 .then(() => null, e => e.message),
@@ -105,7 +107,7 @@ def protocol(client):
         return {methods: methods.map(f => typeof f), desktop: Object.keys(desktop).sort(), receipts};
         """.replace("__SELF_PID__", str(client.process.pid))
     )
-    assert result["result"]["methods"] == ["function"] * 8, result
+    assert result["result"]["methods"] == ["function"] * 10, result
     assert result["result"]["desktop"] == ["launchApp", "listApps", "paste", "readMenuBar", "selectText"], result
     assert "sample at 0" in result["result"]["receipts"][0], result
     assert "InvalidKey" in result["result"]["receipts"][1], result
@@ -116,6 +118,58 @@ def protocol(client):
     assert "Unknown readUI field: typo" in result["error"], result
     result, _ = client.run('return await observeScreen({maxDimension:0});', expect_error=True)
     assert "nonzero" in result["error"].lower(), result
+    result, _ = client.run('return await readTranscript();', expect_error=True)
+    assert "Call startListening before readTranscript" in result["error"], result
+    result, _ = client.run('return await startListening({pid:-1});', expect_error=True)
+    assert "positive PID" in result["error"], result
+    result, _ = client.run(r'return await startListening({pid:1, language:"\0"});', expect_error=True)
+    assert "language tag" in result["error"], result
+
+
+def audio_transcription(client, sample, language, expected_backend):
+    with subprocess.Popen(["/usr/bin/afplay", "-v", "0.25", sample]) as player:
+        try:
+            time.sleep(0.65)
+            assert player.poll() is None, "Audio playback exited before capture started"
+            request = client.start("tools/call", {"name": "run", "arguments": {"code": f"""
+                const started = await startListening({{
+                    pid: {player.pid}, durationMs: 7000, language: {json.dumps(language)}
+                }});
+                const first = await readTranscript({{waitMs: 4500}});
+                const final = await readTranscript({{stop: true}});
+                const drained = await readTranscript();
+                const secondStart = await startListening({{pid: {player.pid}}}).then(
+                    () => null, error => error.message
+                );
+                return {{started, first, final, drained, secondStart}};
+            """}})
+            response = client.wait(request, timeout=30)
+            assert not response.get("isError"), response["content"][0]
+            reply = response["structuredContent"]["result"]
+            assert reply["started"]["pid"] == player.pid, reply
+            if expected_backend:
+                assert reply["started"]["backend"] == expected_backend, reply
+            for receipt in (reply["first"], reply["final"], reply["drained"]):
+                assert receipt["pid"] == player.pid, reply
+            segments = reply["first"]["segments"] + reply["final"]["segments"]
+            assert segments, "No transcript arrived for the speech sample"
+            previous_end = 0
+            for segment in segments:
+                assert segment["text"].strip(), segment
+                assert previous_end <= segment["startMs"] < segment["endMs"] <= 7000, segment
+                previous_end = segment["endMs"]
+            assert reply["final"]["finished"], reply
+            assert reply["drained"]["finished"] and not reply["drained"]["segments"], reply
+            assert "Only one audio observation" in reply["secondStart"], reply
+            print(
+                f"App audio passed via {reply['started']['backend']}: "
+                f"{len(segments)} segment(s), {len(reply['final']['segments'])} returned on stop",
+                flush=True,
+            )
+        finally:
+            if player.poll() is None:
+                player.terminate()
+    _, _ = client.run('return await readTranscript();', expect_error=True)
 
 
 def result(client, code):
@@ -505,6 +559,9 @@ def main():
     group.add_argument("--desktop", action="store_true")
     group.add_argument("--desktop-helpers", action="store_true")
     parser.add_argument("--concurrent-capture", action="store_true")
+    parser.add_argument("--audio-sample", type=Path, help="a speech fixture about 10 seconds or longer")
+    parser.add_argument("--audio-language", default="en")
+    parser.add_argument("--audio-backend", choices=["appleSpeech", "whisper"])
     options = parser.parse_args()
     binary = options.binary.resolve()
     if options.concurrent_capture and not (
@@ -515,6 +572,9 @@ def main():
     with Client(binary) as client:
         protocol(client)
         print("MCP protocol passed")
+        if options.audio_sample:
+            audio_transcription(client, options.audio_sample.resolve(), options.audio_language,
+                                options.audio_backend)
         if options.desktop or options.desktop_helpers:
             with tempfile.TemporaryDirectory(prefix="selvedge-acceptance-") as directory:
                 root = Path(directory)
